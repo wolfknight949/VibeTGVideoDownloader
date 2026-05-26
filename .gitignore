@@ -1,0 +1,24 @@
+# Telegram session files — contain auth tokens, NEVER commit these
+*.session
+*.session-journal
+
+# Environment variables with secrets
+.env
+
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Downloaded media
+telegram_vault/
+downloads/
+
+# Logs
+logs/
+*.log
+recent_groups.json

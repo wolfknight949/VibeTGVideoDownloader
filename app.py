@@ -1,0 +1,1509 @@
+import asyncio
+import io
+import os
+import re
+import urllib.parse
+import zipfile
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi.responses import FileResponse
+from nicegui import app as nicegui_app
+from nicegui import run, ui
+
+from telegram_backend import (
+    DEFAULT_DOWNLOADS_DIR,
+    TASK_STATUS_ICONS,
+    add_recent_group,
+    apply_downloaded_flags,
+    build_posts,
+    create_app_state,
+    delete_downloaded_file,
+    fetch_forum_topics,
+    fetch_group_videos,
+    fetch_topic_videos,
+    filter_completed_incomplete,
+    filter_visible_incomplete,
+    list_downloaded_files,
+    load_recent_groups,
+    queue_downloads,
+    remove_from_queue,
+    remove_recent_group,
+    reset_scan_state,
+    safe_abs_path,
+    scan_downloaded_files,
+    scan_incomplete_downloads,
+    start_download_worker,
+    _is_system_file,
+)
+
+load_dotenv()
+
+
+# ── File-download endpoint ───────────────────────────────────────────────────
+@nicegui_app.get("/api/download-file")
+async def _api_download_file(rel_path: str, dl_dir: str = DEFAULT_DOWNLOADS_DIR):
+    try:
+        abs_dir  = safe_abs_path(dl_dir)
+        abs_path = safe_abs_path(os.path.join(abs_dir, rel_path))
+    except ValueError:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not os.path.isfile(abs_path):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(
+        abs_path,
+        filename=os.path.basename(abs_path),
+        media_type="application/octet-stream",
+    )
+
+
+@nicegui_app.get("/api/download-folder")
+async def _api_download_folder(folder: str, dl_dir: str = DEFAULT_DOWNLOADS_DIR):
+    from fastapi import HTTPException
+    from fastapi.responses import StreamingResponse
+    try:
+        abs_dir        = safe_abs_path(dl_dir)
+        abs_folder     = safe_abs_path(os.path.join(abs_dir, folder)) if folder else abs_dir
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not os.path.isdir(abs_folder):
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    def _iter_zip():
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for root, _, files in os.walk(abs_folder):
+                for fname in sorted(files):
+                    if fname.endswith(".meta.json") or fname.endswith(".part") or _is_system_file(fname):
+                        continue
+                    full = os.path.join(root, fname)
+                    arcname = os.path.relpath(full, abs_folder)
+                    zf.write(full, arcname)
+        buf.seek(0)
+        yield from iter(lambda: buf.read(1024 * 1024), b"")
+
+    zip_name = (os.path.basename(abs_folder) or "downloads") + ".zip"
+    return StreamingResponse(
+        _iter_zip(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
+
+_ENV_API_ID  = int(os.environ.get("TG_API_ID", "0"))
+_ENV_API_HASH = os.environ.get("TG_API_HASH", "")
+
+state = create_app_state()
+post_selections: dict = {}
+expanded_topics: set = set()  # topic_ids currently expanded in the UI
+
+# ── Colour palette ──────────────────────────────────────────────────────────
+_BG       = "#0d1117"
+_CARD     = "#161b22"
+_SURFACE  = "#1c2128"
+_BORDER   = "#21262d"
+_TEXT     = "#e6edf3"
+_MUTED    = "#7d8590"
+_DIM      = "#484f58"
+_BLUE     = "#388bfd"
+_GREEN    = "#3fb950"
+_RED      = "#f85149"
+_YELLOW   = "#d29922"
+_PURPLE   = "#bc8cff"
+_ORANGE   = "#e3b341"
+
+_CSS = f"""
+html, body, .q-page {{ background:{_BG} !important; }}
+
+.q-header {{
+    background:#010409 !important;
+    border-bottom:1px solid {_BORDER};
+    box-shadow:none !important;
+}}
+
+.q-drawer {{
+    background:#010409 !important;
+    border-right:1px solid {_BORDER} !important;
+}}
+.q-drawer .q-separator {{ background:{_BORDER}; opacity:1; }}
+
+.q-card {{ background:{_CARD} !important; border:1px solid {_BORDER}; border-radius:10px !important; }}
+
+/* Expansion */
+.q-expansion-item {{
+    border:1px solid {_BORDER};
+    border-radius:8px !important;
+    overflow:hidden;
+    margin-bottom:2px;
+}}
+.q-expansion-item__container .q-item {{ background:{_SURFACE} !important; }}
+.q-expansion-item__container .q-expansion-item__content {{ background:{_CARD} !important; }}
+
+/* Inputs */
+.q-field--outlined .q-field__control::before {{ border-color:{_BORDER} !important; }}
+.q-field--outlined:hover .q-field__control::before {{ border-color:{_MUTED} !important; }}
+.q-field--outlined.q-field--focused .q-field__control::before {{ border-color:{_BLUE} !important; }}
+.q-field__label {{ color:{_MUTED} !important; }}
+.q-field__native, .q-field__input {{ color:{_TEXT} !important; }}
+.q-field__control {{ background:{_BG} !important; }}
+
+/* Progress */
+.q-linear-progress {{ border-radius:3px; overflow:hidden; }}
+.q-linear-progress__track {{ background:{_SURFACE} !important; }}
+.q-linear-progress__model {{ border-radius:3px; }}
+
+/* Scrollbar */
+::-webkit-scrollbar {{ width:5px; height:5px; }}
+::-webkit-scrollbar-track {{ background:transparent; }}
+::-webkit-scrollbar-thumb {{ background:{_BORDER}; border-radius:3px; }}
+
+/* App-specific */
+.section-lbl {{
+    font-size:0.6rem; font-weight:700; letter-spacing:.12em;
+    text-transform:uppercase; color:{_DIM};
+}}
+.dl-strip {{
+    background:{_SURFACE};
+    border:1px solid {_BORDER};
+    border-radius:8px;
+    padding:12px 16px;
+}}
+.post-row {{
+    width:100%;
+    box-sizing:border-box;
+    border-radius:6px;
+    padding:6px 10px;
+    border:1px solid {_BORDER};
+    background:{_SURFACE};
+    margin-bottom:4px;
+}}
+.q-expansion-item__container .q-expansion-item__content {{
+    padding:8px !important;
+    box-sizing:border-box;
+}}
+.video-row {{
+    border-radius:4px;
+    padding:3px 8px 3px 32px;
+    transition:background .12s;
+}}
+.video-row:hover {{ background:rgba(255,255,255,.04) !important; }}
+.chip {{
+    display:inline-flex; align-items:center;
+    padding:1px 7px; border-radius:12px;
+    font-size:.65rem; font-weight:600; white-space:nowrap;
+}}
+.chip-grey   {{ background:rgba(125,133,144,.12); color:{_MUTED}; border:1px solid rgba(125,133,144,.2); }}
+.chip-green  {{ background:rgba(63,185,80,.12);   color:{_GREEN};  border:1px solid rgba(63,185,80,.25); }}
+.chip-blue   {{ background:rgba(56,139,253,.12);  color:{_BLUE};   border:1px solid rgba(56,139,253,.25); }}
+.chip-red    {{ background:rgba(248,81,73,.12);   color:{_RED};    border:1px solid rgba(248,81,73,.25); }}
+.chip-orange {{ background:rgba(227,179,65,.12);  color:{_ORANGE}; border:1px solid rgba(227,179,65,.25); }}
+.topic-hdr {{
+    padding:8px 12px;
+    border-radius:6px;
+    background:{_SURFACE};
+    margin-bottom:2px;
+    cursor:pointer;
+}}
+"""
+
+
+# ── Pure helpers ────────────────────────────────────────────────────────────
+
+_HASHTAG_RE = re.compile(r"#\w+")
+
+
+def _extract_hashtags(text: str) -> list:
+    return _HASHTAG_RE.findall(text or "")
+
+
+def _get_post_title(post: dict) -> str:
+    if post.get("description"):
+        first_line = post["description"].splitlines()[0].strip()
+        if first_line:
+            return first_line.split(".", 1)[0].strip() or first_line
+    return post["videos"][0]["filename"]
+
+
+def _format_eta(secs: Optional[float]) -> str:
+    if secs is None or secs < 0:
+        return "--"
+    t = int(round(secs))
+    h, r = divmod(t, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def _topic_label_of(post: dict) -> str:
+    name = (post.get("topic_name") or "").strip()
+    tid  = post.get("topic_id", 0)
+    return name or (f"Topic #{tid}" if tid else "")
+
+
+def _group_by_topic(posts: dict) -> list:
+    buckets: dict = {}
+    for gid, post in posts.items():
+        buckets.setdefault(post.get("topic_id", 0), []).append((gid, post))
+    return list(buckets.items())
+
+
+def _topic_targets(topic_posts: list) -> list:
+    return [
+        v for _, p in topic_posts
+        if not p.get("downloaded")
+        for v in p["videos"]
+        if not v.get("downloaded")
+    ]
+
+
+def _checked_targets(posts: dict) -> list:
+    return [
+        v for gid, p in posts.items()
+        if post_selections.get(gid) and not p.get("downloaded")
+        for v in p["videos"]
+        if not v.get("downloaded")
+    ]
+
+
+def _merge_videos(existing: list, new: list) -> list:
+    ids = {v["id"] for v in existing}
+    return list(existing) + [v for v in new if v["id"] not in ids]
+
+
+def _merge_topics(existing: list, new: list) -> list:
+    m = {t["topic_id"]: dict(t) for t in existing}
+    for t in new:
+        e = dict(t)
+        e["loaded"] = m.get(t["topic_id"], {}).get("loaded", False) or t.get("loaded", False)
+        m[t["topic_id"]] = e
+    return sorted(m.values(), key=lambda t: (t.get("last_update_ts", ""), t.get("topic_id", 0)), reverse=True)
+
+
+def _has_cursor(c: dict) -> bool:
+    return bool((c or {}).get("offset_topic"))
+
+
+def _mark_loaded(topic_id: int) -> None:
+    for t in state["forum_topics"]:
+        if t.get("topic_id") == topic_id:
+            t["loaded"] = True
+            break
+
+
+# ── Page ─────────────────────────────────────────────────────────────────────
+
+@ui.page("/")
+def main_page() -> None:
+    ui.colors(
+        primary=_BLUE, secondary=_GREEN, accent=_PURPLE,
+        positive=_GREEN, negative=_RED, warning=_YELLOW, info=_BLUE,
+    )
+    ui.add_css(_CSS)
+
+    # ── App header ──────────────────────────────────────────────────────────
+    with ui.header().classes("items-center gap-3 q-px-md").style("min-height:52px;"):
+        menu_btn = ui.button(icon="menu").props("flat round dense").style(f"color:{_MUTED}")
+        with ui.row().classes("items-center gap-2 no-wrap"):
+            ui.icon("movie", size="22px").style(f"color:{_BLUE}")
+            ui.label("VibeTG").style(f"font-size:1.05rem; font-weight:700; color:{_TEXT}")
+            ui.label("Video Downloader").style(f"font-size:0.72rem; color:{_DIM}; margin-top:2px;")
+        ui.space()
+        header_status = ui.html(
+            f'<span style="font-size:.75rem; color:{_DIM};">Idle</span>',
+            sanitize=False,
+        )
+
+    # ── Settings drawer ─────────────────────────────────────────────────────
+    with ui.left_drawer(value=False, bordered=True).classes("q-pa-lg").style(
+        "background:#010409; border-right:1px solid #21262d; width:280px;"
+    ) as drawer:
+        menu_btn.on("click", drawer.toggle)
+
+        with ui.row().classes("items-center gap-2 q-mb-md"):
+            ui.icon("tune", size="20px").style(f"color:{_BLUE}")
+            ui.label("Settings").style(f"font-size:1rem; font-weight:600; color:{_TEXT}")
+
+        ui.label("Connection").classes("section-lbl q-mt-sm")
+        ui.separator().style(f"background:{_BORDER}; margin:4px 0 10px;")
+
+        if _ENV_API_ID and _ENV_API_HASH:
+            with ui.row().classes("items-center gap-1 q-mb-sm"):
+                ui.icon("verified", size="14px").style(f"color:{_GREEN}")
+                ui.label(".env credentials loaded").style(f"font-size:.72rem; color:{_GREEN};")
+
+        api_id_input = (
+            ui.number("API ID", value=_ENV_API_ID, precision=0)
+            .props("outlined dense dark")
+            .classes("w-full q-mb-sm")
+        )
+        api_hash_input = (
+            ui.input("API Hash", value=_ENV_API_HASH, password=True, password_toggle_button=True)
+            .props("outlined dense dark")
+            .classes("w-full q-mb-sm")
+        )
+        session_input = (
+            ui.input("Session name", value="tg_parser_session")
+            .props("outlined dense dark")
+            .classes("w-full")
+        )
+
+        ui.label("Downloads").classes("section-lbl q-mt-lg")
+        ui.separator().style(f"background:{_BORDER}; margin:4px 0 10px;")
+
+        downloads_input = (
+            ui.input("Output folder", value=DEFAULT_DOWNLOADS_DIR)
+            .props("outlined dense dark")
+            .classes("w-full q-mb-md")
+        )
+
+        chunks_val = ui.label("Parallel chunks: 4").style(
+            f"font-size:.72rem; color:{_MUTED}; margin-bottom:6px;"
+        )
+        chunks_slider = (
+            ui.slider(min=1, max=8, value=4)
+            .props("dark label")
+            .classes("w-full")
+        )
+        chunks_slider.on(
+            "update:model-value",
+            lambda e: chunks_val.set_text(f"Parallel chunks: {int(e.args)}"),
+        )
+
+        parallel_val = ui.label("Parallel files: 1").style(
+            f"font-size:.72rem; color:{_MUTED}; margin-bottom:6px; margin-top:10px;"
+        )
+        parallel_slider = (
+            ui.slider(min=1, max=3, value=1)
+            .props("dark label")
+            .classes("w-full q-mb-md")
+        )
+        parallel_slider.on(
+            "update:model-value",
+            lambda e: parallel_val.set_text(f"Parallel files: {int(e.args)}"),
+        )
+
+        ui.separator().style(f"background:{_BORDER}; margin:20px 0 12px;")
+        ui.label("Run `python login.py` once to authorise your Telegram account.").style(
+            f"font-size:.7rem; color:{_DIM}; line-height:1.5;"
+        )
+
+    # ── Accessors ────────────────────────────────────────────────────────────
+    def _aid()     -> int:  return int(api_id_input.value or 0)
+    def _ahash()   -> str:  return (api_hash_input.value or "").strip()
+    def _sess()    -> str:  return (session_input.value or "tg_parser_session").strip()
+    def _dlpath()  -> str:  return (downloads_input.value or DEFAULT_DOWNLOADS_DIR).strip()
+    def _workers() -> int:  return int(chunks_slider.value)
+    def _parallel_dl() -> int: return int(parallel_slider.value)
+
+    # ── Main content ─────────────────────────────────────────────────────────
+    with ui.column().classes("w-full q-pa-lg gap-5"):
+
+
+        # ── Downloaded files browser ─────────────────────────────────────────
+        files_wrap = ui.column().classes("w-full gap-2")
+        _files_state: dict = {"open": False, "snapshot": None}  # mutable cell
+
+        def _render_files() -> None:
+            dp = _dlpath()
+            files = list_downloaded_files(dp)
+
+            # Build a lightweight snapshot to detect real changes
+            snapshot = [(f["rel_path"], f["size_mb"]) for f in files]
+            if snapshot == _files_state["snapshot"]:
+                return  # nothing changed — don't touch the DOM
+            _files_state["snapshot"] = snapshot
+
+            files_wrap.clear()
+            if not files:
+                return
+
+            total_mb = sum(f["size_mb"] for f in files)
+
+            with files_wrap:
+                with ui.expansion(
+                    f"Downloaded Files  ·  {len(files)} file{'s' if len(files) != 1 else ''}  ·  {total_mb:.0f} MB",
+                    icon="folder",
+                    value=_files_state["open"],
+                ).classes("w-full") as _files_exp:
+                    _files_exp.on(
+                        "update:model-value",
+                        lambda e: _files_state.__setitem__("open", bool(e.args)),
+                    )
+                    with ui.column().classes("gap-0 q-pa-sm"):
+                        # Group by folder
+                        folders: dict = {}
+                        for f in files:
+                            folders.setdefault(f["folder"], []).append(f)
+
+                        for folder, folder_files in sorted(folders.items(), key=lambda x: x[0].lower()):
+                            folder_mb = sum(f["size_mb"] for f in folder_files)
+                            if folder:
+                                with ui.row().classes("items-center gap-1 q-mt-xs q-mb-xs"):
+                                    ui.icon("folder_open", size="14px").style(f"color:{_ORANGE}")
+                                    ui.label(folder).style(
+                                        f"font-size:.73rem; font-weight:600; color:{_ORANGE};"
+                                    )
+                                    ui.label(f"{len(folder_files)} files · {folder_mb:.0f} MB").style(
+                                        f"font-size:.68rem; color:{_DIM};"
+                                    )
+
+                            for fitem in folder_files:
+                                indent = "padding-left:22px;" if folder else ""
+                                with ui.row().classes("w-full items-center gap-2 video-row").style(indent):
+                                    ui.icon("movie", size="13px").style(f"color:{_DIM}")
+                                    ui.label(fitem["filename"]).style(
+                                        f"font-family:monospace; font-size:.75rem; color:{_TEXT}; flex:1;"
+                                        "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                    )
+                                    ui.label(f"{fitem['size_mb']} MB").style(
+                                        f"font-size:.68rem; color:{_DIM}; white-space:nowrap; flex-shrink:0;"
+                                    )
+                                    dl_url = (
+                                        f"/api/download-file"
+                                        f"?rel_path={urllib.parse.quote(fitem['rel_path'])}"
+                                        f"&dl_dir={urllib.parse.quote(dp)}"
+                                    )
+                                    ui.button(
+                                        icon="download",
+                                        on_click=lambda url=dl_url: ui.download(url),
+                                    ).props("flat round dense").tooltip("Save to device").style(
+                                        f"color:{_BLUE}; width:28px; flex-shrink:0;"
+                                    )
+                                    ui.button(
+                                        icon="delete_outline",
+                                        on_click=lambda fi=fitem: _delete_file(fi),
+                                    ).props("flat round dense").tooltip("Delete file").style(
+                                        f"color:{_RED}; width:28px; flex-shrink:0;"
+                                    )
+
+        def _delete_file(fitem: dict) -> None:
+            if delete_downloaded_file(fitem["abs_path"]):
+                ui.notify(f"Deleted {fitem['filename']}", type="warning", position="top-right", timeout=3000)
+            else:
+                ui.notify("Could not delete file.", type="negative", position="top-right")
+            _files_state["snapshot"] = None  # force rebuild after deletion
+            _render_files()
+
+        _render_files()
+        ui.timer(3.0, _render_files)
+
+        # ── Scan form ───────────────────────────────────────────────────────
+        with ui.card().classes("w-full q-pa-md"):
+            with ui.row().classes("items-center gap-2 q-mb-sm"):
+                ui.icon("manage_search", size="18px").style(f"color:{_BLUE}")
+                ui.label("Scan").style(f"font-size:.85rem; font-weight:600; color:{_TEXT}")
+
+            with ui.row().classes("w-full items-end gap-3 flex-wrap"):
+                target_input = (
+                    ui.input(placeholder="@username, t.me/link, or chat ID")
+                    .props("outlined dense dark")
+                    .classes("col-grow")
+                    .style("min-width:180px;")
+                )
+                target_input.props('label="Group / Channel"')
+                target_input.on("keydown.enter", lambda: _do_scan(False))
+
+                search_input = (
+                    ui.input(placeholder="Filename or keyword (optional)")
+                    .props("outlined dense dark")
+                    .classes("col-grow")
+                    .style("min-width:160px;")
+                )
+                search_input.props('label="Search"')
+                search_input.on("keydown.enter", lambda: _do_scan(False))
+
+                batch_input = (
+                    ui.number(value=50, min=1, max=500, precision=0)
+                    .props("outlined dense dark")
+                    .style("width:90px;")
+                )
+                batch_input.props('label="Batch"')
+
+                scan_btn = ui.button(
+                    "Scan topics", icon="search",
+                    on_click=lambda: _do_scan(False),
+                ).props("unelevated").style(
+                    f"background:{_BLUE}; color:#fff; font-weight:600; min-height:36px;"
+                ).tooltip("Fetch one batch of topics (Batch size)")
+                scan_all_btn = ui.button(
+                    "Scan All", icon="cloud_sync",
+                    on_click=lambda: _do_scan(True),
+                ).props("unelevated").style(
+                    f"background:{_SURFACE}; color:{_TEXT}; border:1px solid {_BORDER};"
+                    f" font-weight:600; min-height:36px;"
+                ).tooltip("Fetch all topics at once")
+                ui.button(
+                    icon="close",
+                    on_click=lambda: _clear_scan(),
+                ).props("flat round dense").style(
+                    f"color:{_DIM};"
+                ).tooltip("Clear scan")
+
+            # ── Recent groups ────────────────────────────────────────────────
+            recent_grp_wrap = ui.row().classes("items-center gap-2 flex-wrap q-mt-xs")
+
+        # ── Recent-group helpers ─────────────────────────────────────────────
+        def _render_recent_groups() -> None:
+            recent_grp_wrap.clear()
+            groups = load_recent_groups()
+            if not groups:
+                return
+            with recent_grp_wrap:
+                ui.icon("history", size="14px").style(f"color:{_DIM}")
+                for g in groups:
+                    handle  = g.get("handle", "")
+                    label   = g.get("display_name") or handle
+                    with ui.row().classes("items-center gap-0 no-wrap").style(
+                        f"background:{_SURFACE}; border:1px solid {_BORDER};"
+                        " border-radius:14px; padding:0 4px 0 10px; height:26px;"
+                    ):
+                        ui.label(label).style(
+                            f"font-size:.72rem; color:{_TEXT}; cursor:pointer; white-space:nowrap;"
+                        ).on("click", lambda h=handle: (
+                            target_input.set_value(h),
+                        ))
+                        ui.button(
+                            icon="close",
+                            on_click=lambda h=handle: (
+                                remove_recent_group(h),
+                                _render_recent_groups(),
+                            ),
+                        ).props("flat round dense").style(
+                            f"color:{_DIM}; width:20px; height:20px; font-size:.6rem;"
+                        )
+
+        _render_recent_groups()
+
+        # ── Download monitor ────────────────────────────────────────────────
+        monitor_wrap = ui.column().classes("w-full gap-2")
+        _monitor_state: dict = {"queue_open": True, "incomplete_open": True}
+
+        def _upd_header(active: bool, spd: float) -> None:
+            if active:
+                header_status.content = (
+                    f'<span style="font-size:.75rem; color:{_GREEN};">'
+                    f'● Downloading &nbsp; ⚡ {spd:.1f} MB/s</span>'
+                )
+            else:
+                header_status.content = (
+                    f'<span style="font-size:.75rem; color:{_DIM};">Idle</span>'
+                )
+
+        def _render_monitor() -> None:
+            dp       = _dlpath()
+            p        = state["download_progress"]
+            active   = p.get("active", False)
+            dl_files = scan_downloaded_files(dp)
+            incomplete = filter_visible_incomplete(
+                p, filter_completed_incomplete(scan_incomplete_downloads(dp), dl_files)
+            )
+            queue     = p.get("task_queue", [])
+            done_cnt  = p.get("files_done", 0)
+            spd       = p.get("speed_mbps", 0.0)
+
+            _upd_header(active, spd)
+            monitor_wrap.clear()
+            with monitor_wrap:
+
+                # ── Active progress strip ──────────────────────────────────
+                if active:
+                    bd  = p.get("bytes_done", 0)
+                    bt  = max(p.get("bytes_total", 1), 1)
+                    fn  = p.get("filename", "…")
+                    fi  = p.get("file_idx", 0)
+                    ft  = max(p.get("total_files", 1), 1)
+                    cd  = p.get("chunks_done", 0)
+                    ct  = max(p.get("chunks_total", 1), 1)
+                    fd  = done_cnt
+                    eta = max(bt - bd, 0) / (spd * 1048576) if spd > 0 else None
+                    pfp = p.get("per_file_progress", {})
+                    n_active = sum(1 for t in queue if t.get("status") == "downloading")
+
+                    with ui.element("div").classes("dl-strip"):
+                        with ui.row().classes("w-full items-center gap-2 q-mb-sm"):
+                            ui.icon("downloading", size="16px").style(f"color:{_BLUE}")
+                            if n_active > 1:
+                                ui.label(f"{n_active} files downloading in parallel").style(
+                                    f"font-size:.82rem; font-weight:500; color:{_TEXT}; flex:1;"
+                                )
+                            else:
+                                ui.label(fn).style(
+                                    f"font-size:.82rem; font-weight:500; color:{_TEXT}; flex:1;"
+                                    "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                )
+                            ui.label(
+                                f"File {fi+1}/{ft}"
+                            ).style(f"font-size:.72rem; color:{_MUTED}; white-space:nowrap;")
+                            ui.label(
+                                f"⚡ {spd:.2f} MB/s"
+                            ).style(f"font-size:.72rem; color:{_ORANGE}; white-space:nowrap;")
+                            ui.label(
+                                f"ETA {_format_eta(eta)}"
+                            ).style(f"font-size:.72rem; color:{_MUTED}; white-space:nowrap;")
+                            ui.button(
+                                "Stop", icon="stop",
+                                on_click=_do_stop, color="negative",
+                            ).props("unelevated dense").style(
+                                "min-height:28px; font-size:.72rem;"
+                            )
+
+                        pct_f = bd / bt
+                        ui.label(
+                            f"{bd/1048576:.1f} / {bt/1048576:.1f} MB  ({pct_f*100:.0f}%)"
+                        ).style(f"font-size:.68rem; color:{_MUTED}; margin-bottom:3px;")
+                        ui.linear_progress(pct_f, color="blue-5", size="6px", show_value=False).classes("w-full q-mb-xs")
+
+                        if n_active <= 1:
+                            pct_b = cd / ct if ct else 0
+                            ui.label(
+                                f"Chunks {cd}/{ct}"
+                            ).style(f"font-size:.68rem; color:{_MUTED}; margin-bottom:3px;")
+                            ui.linear_progress(pct_b, color="purple-4", size="4px", show_value=False).classes("w-full")
+
+                # ── Idle / done / error banner ─────────────────────────────
+                elif done_cnt > 0 and not p.get("error"):
+                    with ui.row().classes("items-center gap-2").style(
+                        f"padding:8px 12px; background:{_SURFACE}; border:1px solid rgba(63,185,80,.2);"
+                        f"border-radius:8px;"
+                    ):
+                        ui.icon("check_circle", size="16px").style(f"color:{_GREEN}")
+                        ui.label(
+                            f"Done — {done_cnt} file{'s' if done_cnt != 1 else ''} saved to /{dp}"
+                        ).style(f"font-size:.82rem; color:{_GREEN};")
+
+                if p.get("error"):
+                    with ui.row().classes("items-center gap-2").style(
+                        f"padding:8px 12px; background:{_SURFACE}; border:1px solid rgba(248,81,73,.2);"
+                        f"border-radius:8px;"
+                    ):
+                        ui.icon("error_outline", size="16px").style(f"color:{_RED}")
+                        ui.label(p["error"]).style(f"font-size:.82rem; color:{_RED};")
+
+                # ── Queue ──────────────────────────────────────────────────
+                if queue:
+                    with ui.expansion(
+                        f"Queue  ({len(queue)} files)",
+                        value=_monitor_state["queue_open"],
+                    ).classes("w-full") as _q_exp:
+                        _q_exp.on("update:model-value", lambda e: _monitor_state.__setitem__("queue_open", bool(e.args)))
+                        with ui.column().classes("gap-1 q-pa-sm"):
+                            pfp = p.get("per_file_progress", {})
+                            for task in queue:
+                                tst = task.get("status", "queued")
+                                c   = {
+                                    "done": _GREEN, "downloading": _BLUE,
+                                    "error": _RED, "stopped": _YELLOW,
+                                    "skipped": _MUTED,
+                                }.get(tst, _MUTED)
+                                icon = TASK_STATUS_ICONS.get(tst, "•")
+                                with ui.row().classes("items-center gap-2"):
+                                    ui.label(icon).style(f"color:{c}; font-size:.82rem; width:16px;")
+                                    ui.label(task["filename"]).style(
+                                        f"color:{_TEXT}; font-size:.78rem; flex:1;"
+                                        "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                    )
+                                    if tst == "downloading":
+                                        fp = pfp.get(str(task.get("id", "")), {})
+                                        if fp and fp.get("bytes_total", 0) > 0:
+                                            pct = fp["bytes_done"] / fp["bytes_total"] * 100
+                                            spd_f = fp.get("speed_mbps", 0.0)
+                                            ui.label(f"{pct:.0f}% · {spd_f:.1f} MB/s").style(
+                                                f"color:{_BLUE}; font-size:.7rem; white-space:nowrap;"
+                                            )
+                                        else:
+                                            ui.label("starting…").style(
+                                                f"color:{_MUTED}; font-size:.7rem; white-space:nowrap;"
+                                            )
+                                    else:
+                                        ui.label(f"{task.get('size_mb', 0)} MB").style(
+                                            f"color:{_DIM}; font-size:.7rem; white-space:nowrap;"
+                                        )
+                                    if tst == "queued":
+                                        ui.button(
+                                            icon="close",
+                                            on_click=lambda t=task: (
+                                                remove_from_queue(state["download_progress"], t["id"]),
+                                                _render_monitor(),
+                                            ),
+                                        ).props("flat round dense").tooltip("Remove from queue").style(
+                                            f"color:{_DIM}; width:24px;"
+                                        )
+
+                # ── Resume incomplete ──────────────────────────────────────
+                if incomplete:
+                    with ui.expansion(
+                        f"Interrupted  ({len(incomplete)})",
+                        value=_monitor_state["incomplete_open"],
+                    ).classes("w-full") as _inc_exp:
+                        _inc_exp.on("update:model-value", lambda e: _monitor_state.__setitem__("incomplete_open", bool(e.args)))
+                        with ui.column().classes("gap-2 q-pa-sm"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.button(
+                                    "Resume all", icon="play_arrow",
+                                    on_click=lambda i=incomplete, dlf=dl_files: _resume_all(i, dlf),
+                                ).props("unelevated dense").style(
+                                    f"background:{_SURFACE}; color:{_GREEN}; border:1px solid rgba(63,185,80,.3);"
+                                    "font-size:.75rem;"
+                                )
+                                ui.label(
+                                    f"{len(incomplete)} download(s) can be resumed"
+                                ).style(f"font-size:.75rem; color:{_MUTED};")
+
+                            for inc in incomplete:
+                                with ui.row().classes("items-center gap-2 video-row"):
+                                    ui.icon("insert_drive_file", size="14px").style(f"color:{_DIM}")
+                                    ui.label(inc["filename"]).style(
+                                        f"color:{_TEXT}; font-size:.78rem; flex:1;"
+                                        "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                    )
+                                    ui.label(
+                                        f"{inc.get('_part_size_mb', 0)}/{inc.get('size_mb', '?')} MB"
+                                    ).style(f"color:{_DIM}; font-size:.7rem; white-space:nowrap;")
+                                    ui.button(icon="add", on_click=lambda i=inc, dlf=dl_files: _resume_one(i, dlf)
+                                    ).props("flat round dense").tooltip("Queue this file").style(
+                                        f"color:{_BLUE}"
+                                    )
+                                    ui.button(icon="delete_outline", on_click=lambda i=inc: _delete_inc(i)
+                                    ).props("flat round dense").tooltip("Delete partial file").style(
+                                        f"color:{_RED}"
+                                    )
+
+        def _do_stop() -> None:
+            state["stop_event"].set()
+            ui.notify("Stop signal sent.", type="warning", position="top-right", timeout=3000)
+            _render_monitor()
+
+        def _start_worker() -> None:
+            state["stop_event"].clear()
+            start_download_worker(
+                _aid(), _ahash(), _sess(), _dlpath(), _dlpath(),
+                _workers(), state["stop_event"], state["download_progress"],
+                parallel_downloads=_parallel_dl(),
+            )
+            monitor_timer.active = True
+
+        def _resume_all(incomplete: list, dl_files: list) -> None:
+            targets = [
+                {
+                    "id": i["msg_id"], "filename": i["filename"],
+                    "size_bytes": i.get("size_bytes") or i.get("total_size", 0),
+                    "size_mb": i.get("size_mb", 0), "date": i.get("date", ""),
+                    "chat": i.get("chat", ""), "topic_id": i.get("topic_id", 0),
+                    "topic_name": i.get("topic_name", ""),
+                }
+                for i in incomplete
+            ]
+            r = queue_downloads(state["download_progress"], targets, downloaded_files=dl_files)
+            if r["added"]:
+                _start_worker(); _render_monitor()
+            elif r["already_downloaded"]:
+                ui.notify("All already downloaded.", type="info", position="top-right")
+
+        def _resume_one(inc: dict, dl_files: list) -> None:
+            r = queue_downloads(
+                state["download_progress"],
+                [{
+                    "id": inc["msg_id"], "filename": inc["filename"],
+                    "size_bytes": inc.get("size_bytes") or inc.get("total_size", 0),
+                    "size_mb": inc.get("size_mb", 0), "date": inc.get("date", ""),
+                    "chat": inc.get("chat", ""), "topic_id": inc.get("topic_id", 0),
+                    "topic_name": inc.get("topic_name", ""),
+                }],
+                downloaded_files=dl_files,
+            )
+            if r["added"]:
+                _start_worker(); _render_monitor()
+            elif r["already_downloaded"]:
+                ui.notify("Already downloaded.", type="info", position="top-right")
+
+        def _delete_inc(inc: dict) -> None:
+            for path in (inc.get("_part_path", ""), inc.get("_meta_path", "")):
+                if path and os.path.exists(path):
+                    try: os.remove(path)
+                    except OSError: pass
+            _render_monitor()
+
+        _render_monitor()
+        monitor_timer = ui.timer(
+            0.5, _render_monitor,
+            active=bool(state["download_progress"].get("active")),
+        )
+
+
+        # ── Inventory ───────────────────────────────────────────────────────
+        inv_wrap = ui.column().classes("w-full gap-2")
+
+        def _launch(targets: list) -> None:
+            dp = _dlpath()
+            r  = queue_downloads(
+                state["download_progress"], targets,
+                default_chat=(target_input.value or "").strip(),
+                downloaded_files=scan_downloaded_files(dp),
+            )
+            if r["added"]:
+                _start_worker(); _render_monitor(); _render_inv()
+            elif r["already_downloaded"]:
+                ui.notify("Already downloaded.", type="info", position="top-right")
+
+        def _render_inv() -> None:
+            inv_wrap.clear()
+            dp           = _dlpath()
+            dl_files     = scan_downloaded_files(dp)
+            videos       = state.get("found_videos", [])
+            forum_topics = state.get("forum_topics", [])
+            scan_mode    = state.get("scan_mode", "messages")
+            loaded_grp   = state.get("scan_loaded_group", "")
+            loaded_q     = state.get("scan_loaded_search_query", "")
+
+            with inv_wrap:
+                if not videos and not forum_topics:
+                    with ui.row().classes("items-center gap-2").style(
+                        f"padding:20px; background:{_CARD}; border:1px solid {_BORDER}; border-radius:10px;"
+                    ):
+                        ui.icon("inbox", size="20px").style(f"color:{_DIM}")
+                        if loaded_grp:
+                            q_part = f' matching "{loaded_q}"' if loaded_q else ""
+                            ui.label(f"No videos found in {loaded_grp}{q_part}.").style(
+                                f"font-size:.85rem; color:{_MUTED};"
+                            )
+                        else:
+                            ui.label("Enter a group above and click Scan to find videos.").style(
+                                f"font-size:.85rem; color:{_MUTED};"
+                            )
+                    return
+
+                posts        = build_posts(videos)
+                apply_downloaded_flags(posts, dl_files)
+                all_v        = [v for p in posts.values() for v in p["videos"]]
+                sel          = _checked_targets(posts)
+                total        = sum(v["size_mb"] for v in all_v)
+                sel_mb       = sum(v["size_mb"] for v in sel)
+                loading_more = state.get("loading_more", False)
+
+                # Toolbar
+                with ui.column().classes("w-full gap-0").style(
+                    f"padding:10px 14px; background:{_CARD}; border:1px solid {_BORDER};"
+                    "border-radius:10px;"
+                ):
+                    # Stats + actions row
+                    with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                        if scan_mode == "forum_topics" and forum_topics:
+                            lc = sum(1 for t in forum_topics if t.get("loaded"))
+                            ul = len(forum_topics) - lc
+                            _chip(f"{len(forum_topics)} topics")
+                            if lc:
+                                _chip(f"{lc} loaded", "green")
+                            if ul:
+                                _chip(f"{ul} unloaded")
+                            _chip(f"{len(posts)} posts")
+                            _chip(f"{len(all_v)} videos")
+                            _chip(f"{total:.0f} MB")
+                        else:
+                            _chip(f"{len(posts)} posts")
+                            _chip(f"{len(all_v)} videos")
+                            _chip(f"{total:.0f} MB")
+                            if loaded_q:
+                                _chip(f'"{loaded_q}"', "blue")
+                        ui.space()
+                        if scan_mode == "forum_topics":
+                            unloaded_topics = [t for t in forum_topics if not t.get("loaded")]
+                            if unloaded_topics:
+                                ui.button(
+                                    f"Fetch All  ({len(unloaded_topics)})", icon="cloud_download",
+                                    on_click=lambda: _fetch_all_topics(),
+                                ).props("flat dense").style(
+                                    f"font-size:.75rem; color:{_BLUE};"
+                                ).tooltip("Fetch all unloaded topics at once")
+                        ui.button(
+                            "Select all", icon="done_all",
+                            on_click=lambda p=posts: _sel_all(p),
+                        ).props("flat dense").style(f"font-size:.75rem; color:{_MUTED};")
+                        ui.button(
+                            "Clear", icon="remove_done",
+                            on_click=lambda p=posts: _sel_clear(p),
+                        ).props("flat dense").style(f"font-size:.75rem; color:{_MUTED};")
+                        dl_label = (
+                            f"Download  ({len(sel)})  ·  {sel_mb:.0f} MB" if sel
+                            else "Download selected"
+                        )
+                        ui.button(
+                            dl_label,
+                            icon="download",
+                            on_click=lambda s=sel: _launch(s),
+                        ).props("unelevated dense" + (" disabled" if not sel else "")).style(
+                            f"background:{_BLUE if sel else _SURFACE}; color:{'#fff' if sel else _DIM};"
+                            f" font-weight:600; font-size:.78rem;"
+                        )
+
+                # Topic / post tree
+                _render_tree(posts, forum_topics, scan_mode)
+
+                # Load more
+                if state.get("scan_has_more"):
+                    with ui.row().classes("w-full justify-center q-mt-sm"):
+                        lbl = "Load more topics" if scan_mode == "forum_topics" else "Load more posts"
+                        ui.button(
+                            lbl, icon="expand_more",
+                            on_click=lambda: _load_more(),
+                        ).props("flat" + (" loading disabled" if loading_more else "")).style(
+                            f"color:{_MUTED}; font-size:.78rem;"
+                        )
+
+        def _chip(text: str, kind: str = "grey") -> None:
+            ui.element("span").classes(f"chip chip-{kind}").text = text
+
+        def _trf(tid) -> set:
+            return state.get("topic_res_filters", {}).get(tid, set())
+
+        def _toggle_trf(tid, res: str) -> None:
+            filters = state.setdefault("topic_res_filters", {})
+            f = filters.setdefault(tid, set())
+            if res in f:
+                f.discard(res)
+            else:
+                f.add(res)
+            _render_inv()
+
+        def _clear_trf(tid) -> None:
+            state.setdefault("topic_res_filters", {}).pop(tid, None)
+            _render_inv()
+
+        def _thf(tid) -> set:
+            return state.get("topic_hashtag_filters", {}).get(tid, set())
+
+        def _toggle_thf(tid, tag: str) -> None:
+            filters = state.setdefault("topic_hashtag_filters", {})
+            f = filters.setdefault(tid, set())
+            if tag in f:
+                f.discard(tag)
+            else:
+                f.add(tag)
+            _render_inv()
+
+        def _clear_thf(tid) -> None:
+            state.setdefault("topic_hashtag_filters", {}).pop(tid, None)
+            _render_inv()
+
+        def _clear_all_filters(tid) -> None:
+            state.setdefault("topic_res_filters", {}).pop(tid, None)
+            state.setdefault("topic_hashtag_filters", {}).pop(tid, None)
+            _render_inv()
+
+        def _sel_all(posts: dict) -> None:
+            for gid, p in posts.items():
+                if not p.get("downloaded"):
+                    post_selections[gid] = True
+            _render_inv()
+
+        def _sel_clear(posts: dict) -> None:
+            post_selections.clear()
+            _render_inv()
+
+        def _render_tree(posts: dict, forum_topics: list, scan_mode: str) -> None:
+            def _filtered_targets(topic_posts: list, tid) -> list:
+                trf = _trf(tid)
+                thf = _thf(tid)
+                result = []
+                for _, p in topic_posts:
+                    if p.get("downloaded"):
+                        continue
+                    if thf:
+                        post_tags = set(_extract_hashtags(p.get("description", "")))
+                        if not post_tags & thf:
+                            continue
+                    for v in p["videos"]:
+                        if not v.get("downloaded") and (not trf or v.get("resolution") in trf):
+                            result.append(v)
+                return result
+
+            def _topic_filter_row(tid, tvids: list, topic_posts: list) -> None:
+                trf = _trf(tid)
+                thf = _thf(tid)
+                has_active = bool(trf or thf)
+
+                topic_res = sorted({v.get("resolution", "") for v in tvids if v.get("resolution")})
+                topic_hashtags = sorted({
+                    tag for _, p in topic_posts
+                    for tag in _extract_hashtags(p.get("description", ""))
+                })
+
+                if not topic_res and not topic_hashtags:
+                    return
+
+                active_bg = (
+                    "background:rgba(56,139,253,.12); border:1px solid rgba(56,139,253,.45);"
+                    if has_active else f"border:1px solid {_BORDER};"
+                )
+                with ui.column().classes("gap-1 q-pb-sm").style(
+                    f"padding:6px 10px; border-radius:6px; margin-bottom:6px; {active_bg}"
+                ):
+                    if has_active:
+                        with ui.row().classes("items-center gap-1 q-mb-xs"):
+                            ui.icon("filter_alt", size="13px").style(f"color:{_BLUE}")
+                            ui.label("Filters active").style(
+                                f"font-size:.68rem; font-weight:700; color:{_BLUE};"
+                            )
+                            ui.space()
+                            ui.button(
+                                "Clear all", icon="close",
+                                on_click=lambda t=tid: _clear_all_filters(t),
+                            ).props("flat dense").style(f"font-size:.68rem; color:{_RED};")
+
+                    if topic_res:
+                        with ui.row().classes("items-center gap-1 flex-wrap"):
+                            ui.label("Res:").style(f"font-size:.7rem; color:{_DIM}; white-space:nowrap;")
+                            for r in topic_res:
+                                active = r in trf
+                                label = f"✓ {r}" if active else r
+                                ui.button(
+                                    label, on_click=lambda res=r, t=tid: _toggle_trf(t, res),
+                                ).props("unelevated dense").style(
+                                    "font-size:.72rem; min-height:24px; padding:0 10px;"
+                                    + (
+                                        f" background:#1d6feb; color:#fff; font-weight:700;"
+                                        f" border:2px solid #5ba3ff;"
+                                        f" box-shadow:0 0 8px rgba(91,163,255,.55);"
+                                        if active else
+                                        f" background:{_SURFACE}; color:{_DIM};"
+                                        f" border:1px solid {_BORDER};"
+                                    )
+                                )
+                            if trf and not thf:
+                                ui.button(
+                                    "✕", on_click=lambda t=tid: _clear_trf(t),
+                                ).props("flat dense").style(f"font-size:.7rem; color:{_RED};")
+
+                    if topic_hashtags:
+                        with ui.row().classes("items-center gap-1 flex-wrap"):
+                            ui.label("Tags:").style(f"font-size:.7rem; color:{_DIM}; white-space:nowrap;")
+                            for tag in topic_hashtags:
+                                active = tag in thf
+                                label = f"✓ {tag}" if active else tag
+                                ui.button(
+                                    label, on_click=lambda tg=tag, t=tid: _toggle_thf(t, tg),
+                                ).props("unelevated dense").style(
+                                    "font-size:.72rem; min-height:24px; padding:0 10px;"
+                                    + (
+                                        f" background:#7c3aed; color:#fff; font-weight:700;"
+                                        f" border:2px solid #c084fc;"
+                                        f" box-shadow:0 0 8px rgba(192,132,252,.55);"
+                                        if active else
+                                        f" background:{_SURFACE}; color:{_DIM};"
+                                        f" border:1px solid {_BORDER};"
+                                    )
+                                )
+                            if thf and not trf:
+                                ui.button(
+                                    "✕", on_click=lambda t=tid: _clear_thf(t),
+                                ).props("flat dense").style(f"font-size:.7rem; color:{_RED};")
+
+            if scan_mode == "forum_topics" and forum_topics:
+                topic_map = {tid: tp for tid, tp in _group_by_topic(posts)}
+                for topic in forum_topics:
+                    tid      = topic["topic_id"]
+                    tlabel   = topic.get("topic_name") or f"Topic #{tid}"
+                    tp       = topic_map.get(tid, [])
+                    loaded   = topic.get("loaded", False)
+                    tvids    = [v for _, p in tp for v in p["videos"]]
+                    tmb      = sum(v["size_mb"] for v in tvids)
+                    tgts     = _filtered_targets(tp, tid)
+
+                    hdr = tlabel
+                    if loaded:
+                        res_counts: dict = {}
+                        for v in tvids:
+                            r = v.get("resolution", "")
+                            if r:
+                                res_counts[r] = res_counts.get(r, 0) + 1
+                        res_part = ("  ·  " + "  ".join(
+                            f"{c}×{r}" for r, c in sorted(res_counts.items())
+                        )) if res_counts else ""
+                        hdr += f"  ·  {len(tp)} posts  ·  {len(tvids)} vids  ·  {tmb:.0f} MB{res_part}"
+                        if _trf(tid) or _thf(tid):
+                            hdr += "  ·  🔍"
+                    else:
+                        hdr += f"  ·  updated {topic.get('last_update', '--')}"
+
+                    if not loaded:
+                        fetching = tid in state.get("fetching_topics", set())
+                        with ui.row().classes("w-full items-center gap-2").style(
+                            f"padding:8px 12px; background:{_SURFACE}; border:1px solid {_BORDER};"
+                            " border-radius:8px; margin-bottom:2px;"
+                        ):
+                            ui.icon("topic", size="15px").style(f"color:{_DIM}")
+                            ui.label(tlabel).style(
+                                f"font-size:.82rem; font-weight:500; color:{_TEXT}; flex:1;"
+                                " overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                            )
+                            ui.label(f"updated {topic.get('last_update', '--')}").style(
+                                f"font-size:.7rem; color:{_DIM}; white-space:nowrap;"
+                            )
+                            ui.button(
+                                "Fetching…" if fetching else "Fetch topic",
+                                icon="cloud_download",
+                                on_click=lambda t=topic: _load_topic(t),
+                            ).props(
+                                "unelevated dense" + (" loading disabled" if fetching else "")
+                            ).style(
+                                f"background:{_SURFACE}; color:{_BLUE if not fetching else _MUTED};"
+                                f" border:1px solid {_BORDER}; font-size:.75rem;"
+                            )
+                    else:
+                        is_open = tid in expanded_topics
+                        with ui.expansion(hdr, value=is_open).classes("w-full") as exp:
+                            exp.on("update:model-value", lambda e, t=tid: (
+                                expanded_topics.add(t) if e.args else expanded_topics.discard(t)
+                            ))
+                            _topic_filter_row(tid, tvids, tp)
+                            _topic_actions(tp, tgts, tid)
+                            trf = _trf(tid)
+                            thf = _thf(tid)
+                            for gid, post in tp:
+                                _render_post(gid, post, trf, thf)
+            else:
+                for tid, tp in _group_by_topic(posts):
+                    lbl    = _topic_label_of(tp[0][1]) if tid else "General"
+                    tvids  = [v for _, p in tp for v in p["videos"]]
+                    tmb    = sum(v["size_mb"] for v in tvids)
+                    tgts   = _filtered_targets(tp, tid)
+                    filter_indicator = "  ·  🔍" if (_trf(tid) or _thf(tid)) else ""
+                    hdr    = f"{lbl}  ·  {len(tp)} posts  ·  {len(tvids)} videos  ·  {tmb:.1f} MB{filter_indicator}"
+                    is_open = tid in expanded_topics
+                    with ui.expansion(hdr, value=is_open).classes("w-full") as exp:
+                        exp.on("update:model-value", lambda e, t=tid: (
+                            expanded_topics.add(t) if e.args else expanded_topics.discard(t)
+                        ))
+                        _topic_filter_row(tid, tvids, tp)
+                        _topic_actions(tp, tgts, tid)
+                        trf = _trf(tid)
+                        thf = _thf(tid)
+                        for gid, post in tp:
+                            _render_post(gid, post, trf, thf)
+
+        def _topic_actions(topic_posts: list, tgts: list, tid) -> None:
+            with ui.row().classes("items-center gap-1 q-pb-xs").style(
+                f"border-bottom:1px solid {_BORDER}; margin-bottom:6px;"
+            ):
+                ui.space()
+                btn_sel = ui.button(
+                    "Select topic", icon="check_box",
+                    on_click=lambda tp=topic_posts, t=tid: _sel_topic(tp, t),
+                ).props("flat dense").style(f"font-size:.72rem; color:{_MUTED};")
+                if not tgts:
+                    btn_sel.props("disabled")
+                btn_dl = ui.button(
+                    f"Download  ({len(tgts)})", icon="download",
+                    on_click=lambda t=tgts: _launch(t),
+                ).props("flat dense").style(
+                    f"font-size:.72rem; color:{_BLUE if tgts else _DIM};"
+                )
+                if not tgts:
+                    btn_dl.props("disabled")
+
+        def _sel_topic(topic_posts: list, tid) -> None:
+            trf = _trf(tid)
+            thf = _thf(tid)
+            for gid, p in topic_posts:
+                if not p.get("downloaded"):
+                    if thf:
+                        post_tags = set(_extract_hashtags(p.get("description", "")))
+                        if not post_tags & thf:
+                            continue
+                    vids = p["videos"]
+                    if not trf or any(v.get("resolution") in trf for v in vids if not v.get("downloaded")):
+                        post_selections[gid] = True
+            _render_inv()
+
+        def _render_post(gid: str, post: dict, res_filter: set, hashtag_filter: set = None) -> None:
+            if hashtag_filter:
+                post_tags = set(_extract_hashtags(post.get("description", "")))
+                if not post_tags & hashtag_filter:
+                    return
+            post_dl      = post.get("downloaded", False)
+            all_videos   = post["videos"]
+            videos       = [v for v in all_videos if not res_filter or v.get("resolution") in res_filter]
+            if not videos:
+                return
+            n   = len(videos)
+            tmb = sum(v["size_mb"] for v in videos)
+            title = _get_post_title(post)
+
+            with ui.element("div").classes("post-row w-full"):
+                # Post header
+                with ui.row().classes("w-full items-center gap-2"):
+                    chk = ui.checkbox(
+                        "", value=post_selections.get(gid, False),
+                        on_change=lambda e, g=gid: post_selections.__setitem__(g, e.value),
+                    ).props("dense dark")
+                    if post_dl:
+                        chk.props("disabled")
+
+                    if post_dl:
+                        ui.icon("check_circle", size="15px").style(f"color:{_GREEN}")
+                    else:
+                        ui.icon("folder_open", size="15px").style(f"color:{_MUTED}")
+
+                    ui.label(title).style(
+                        f"font-size:.82rem; font-weight:500; color:{'#3fb950' if post_dl else _TEXT};"
+                        " flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                    )
+
+                    ui.label(post["date"]).style(f"font-size:.68rem; color:{_DIM}; white-space:nowrap;")
+                    ui.element("span").classes("chip chip-grey").style(
+                        "font-size:.62rem;"
+                    ).text = f"{n} video{'s' if n > 1 else ''}  ·  {tmb:.1f} MB"
+
+                    post_btn = ui.button(
+                        icon="check" if post_dl else "download",
+                        on_click=lambda v=videos: _launch(v),
+                    ).props("flat round dense").style(
+                        f"color:{_GREEN if post_dl else _BLUE};"
+                    ).tooltip("Download all in post")
+                    if post_dl:
+                        post_btn.props("disabled")
+
+                # Description
+                if not post_dl and post.get("description"):
+                    ui.label(post["description"][:180]).style(
+                        f"font-size:.72rem; color:{_DIM}; padding:2px 0 4px 26px;"
+                    )
+
+                # Videos
+                with ui.column().classes("w-full gap-0"):
+                    for vv in videos:
+                        vdl = vv.get("downloaded", False)
+                        res = vv.get("resolution", "")
+                        with ui.row().classes("w-full items-center gap-2 video-row"):
+                            ui.icon(
+                                "check_circle" if vdl else "play_circle_outline",
+                                size="13px",
+                            ).style(f"color:{_GREEN if vdl else _DIM}")
+                            ui.label(vv["filename"]).style(
+                                f"font-family:monospace; font-size:.75rem;"
+                                f" color:{_MUTED if vdl else _TEXT}; flex:1;"
+                                "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                            )
+                            if res:
+                                ui.label(res).classes(
+                                    "chip chip-blue" if res in res_filter else "chip chip-grey"
+                                ).style("font-size:.6rem; flex-shrink:0;")
+                            ui.label(f"{vv['size_mb']} MB").style(
+                                f"font-size:.68rem; color:{_DIM}; white-space:nowrap; flex-shrink:0;"
+                            )
+                            vbtn = ui.button(
+                                icon="check" if vdl else "download",
+                                on_click=lambda v=vv: _launch([v]),
+                            ).props("flat round dense").style(
+                                f"color:{_GREEN if vdl else _BLUE}; width:28px; flex-shrink:0;"
+                            ).tooltip("Downloaded" if vdl else f"Download {vv['filename']}")
+                            if vdl:
+                                vbtn.props("disabled")
+
+        async def _load_topic(topic: dict) -> None:
+            tid    = topic["topic_id"]
+            tlabel = topic.get("topic_name") or f"Topic #{tid}"
+            state.setdefault("fetching_topics", set()).add(tid)
+            _render_inv()
+            status = None
+            payload = None
+            try:
+                status, payload, _ = await run.io_bound(
+                    asyncio.run,
+                    fetch_topic_videos(
+                        _aid(), _ahash(), _sess(),
+                        state.get("scan_loaded_group", ""),
+                        tid, topic_name=topic.get("topic_name", ""),
+                    ),
+                )
+                if status == "SUCCESS":
+                    state["found_videos"] = _merge_videos(state["found_videos"], payload)
+                    _mark_loaded(tid)
+                    ui.notify(f'Loaded {len(payload)} video(s) from "{tlabel}".', type="positive", position="top-right")
+                elif status == "AUTH_NEEDED":
+                    ui.notify("Run `python login.py` to authenticate.", type="warning", position="top-right")
+                else:
+                    ui.notify(f"Load failed: {payload}", type="negative", position="top-right")
+            except Exception as exc:
+                ui.notify(f"Load failed: {exc}", type="negative", position="top-right")
+            finally:
+                state.get("fetching_topics", set()).discard(tid)
+                _render_inv()
+                await asyncio.sleep(0)
+
+        async def _fetch_all_topics() -> None:
+            unloaded = [
+                t for t in state.get("forum_topics", [])
+                if not t.get("loaded") and t["topic_id"] not in state.get("fetching_topics", set())
+            ]
+            if not unloaded:
+                ui.notify("All topics already loaded.", type="info", position="top-right")
+                return
+            ui.notify(f"Fetching {len(unloaded)} topics…", type="info", position="top-right")
+            for topic in unloaded:
+                await _load_topic(topic)
+
+        def _clear_scan() -> None:
+            target_input.set_value("")
+            search_input.set_value("")
+            reset_scan_state(state)
+            state["topic_res_filters"] = {}
+            state["topic_hashtag_filters"] = {}
+            post_selections.clear()
+            expanded_topics.clear()
+            _render_inv()
+
+        async def _load_more() -> None:
+            state["loading_more"] = True
+            _render_inv()
+            scan_mode = state.get("scan_mode", "messages")
+            aid, ah, sess = _aid(), _ahash(), _sess()
+            target   = state.get("scan_loaded_group", "")
+            search_q = state.get("scan_loaded_search_query", "")
+            page_sz  = int(batch_input.value or 50)
+
+            if scan_mode == "forum_topics":
+                cur = state.get("scan_forum_cursor", {})
+                status, payload, next_cur, _ = await run.io_bound(
+                    asyncio.run,
+                    fetch_forum_topics(
+                        aid, ah, sess, target, page_size=page_sz,
+                        offset_date=cur.get("offset_date", ""),
+                        offset_id=cur.get("offset_id", 0),
+                        offset_topic=cur.get("offset_topic", 0),
+                    ),
+                )
+                if status == "SUCCESS":
+                    state["forum_topics"] = _merge_topics(state["forum_topics"], payload)
+                    state["scan_forum_cursor"] = next_cur
+                    state["scan_has_more"] = _has_cursor(next_cur)
+                elif status == "AUTH_NEEDED":
+                    state["loading_more"] = False
+                    ui.notify("Authentication required.", type="warning", position="top-right"); return
+                else:
+                    state["loading_more"] = False
+                    ui.notify(f"Load more failed: {payload}", type="negative", position="top-right"); return
+            else:
+                status, payload, nxt, _ = await run.io_bound(
+                    asyncio.run,
+                    fetch_group_videos(
+                        aid, ah, sess, target, page_size=page_sz,
+                        offset_id=state.get("scan_offset_id", 0),
+                        search_query=search_q, expand_topics=False,
+                    ),
+                )
+                if status == "SUCCESS":
+                    state["found_videos"] = _merge_videos(state["found_videos"], payload)
+                    state["scan_offset_id"] = nxt
+                    state["scan_has_more"] = nxt != 0
+                elif status == "AUTH_NEEDED":
+                    ui.notify("Authentication required.", type="warning", position="top-right"); return
+                else:
+                    ui.notify(f"Load more failed: {payload}", type="negative", position="top-right"); return
+            state["loading_more"] = False
+            _render_inv()
+
+        async def _do_scan(fetch_all: bool) -> None:
+            aid, ah, sess = _aid(), _ahash(), _sess()
+            target   = (target_input.value or "").strip()
+            search_q = (search_input.value or "").strip()
+            page_sz  = int(batch_input.value or 50)
+
+            if not aid or not ah or not target:
+                ui.notify("Enter API credentials and a target group.", type="negative", position="top-right")
+                return
+
+            reset_scan_state(state, target_group=target, search_query=search_q)
+            state["topic_res_filters"] = {}
+            state["topic_hashtag_filters"] = {}
+            post_selections.clear()
+            expanded_topics.clear()
+            scan_btn.props("loading")
+            scan_all_btn.props("loading")
+
+            try:
+                status = "NOT_STARTED"
+                payload = None
+
+                if not search_q:
+                    collected: list = []
+                    cursor = state["scan_forum_cursor"]
+                    while True:
+                        status, payload, next_cur, _ = await run.io_bound(
+                            asyncio.run,
+                            fetch_forum_topics(
+                                aid, ah, sess, target, page_size=page_sz,
+                                offset_date=cursor.get("offset_date", ""),
+                                offset_id=cursor.get("offset_id", 0),
+                                offset_topic=cursor.get("offset_topic", 0),
+                            ),
+                        )
+                        if status != "SUCCESS":
+                            break
+                        collected = _merge_topics(collected, payload)
+                        cursor = next_cur
+                        if not fetch_all or not _has_cursor(next_cur):
+                            break
+
+                    if status == "SUCCESS" and collected:
+                        state["forum_topics"] = collected
+                        state["scan_forum_cursor"] = cursor
+                        state["scan_has_more"] = not fetch_all and _has_cursor(cursor)
+                        state["scan_mode"] = "forum_topics"
+                        add_recent_group(target)
+                        _render_recent_groups()
+                        ui.notify(f"Loaded {len(collected)} topics.", type="positive", position="top-right")
+                        _render_inv(); return
+                    elif status == "AUTH_NEEDED":
+                        ui.notify("Run `python login.py` to authenticate.", type="warning", position="top-right"); return
+                    elif status not in {"NOT_FORUM", "SUCCESS"}:
+                        ui.notify(f"Scan error: {payload}", type="negative", position="top-right"); return
+
+                # message scan
+                collected_v: list = []
+                offset = 0
+                while True:
+                    status, payload, nxt, _ = await run.io_bound(
+                        asyncio.run,
+                        fetch_group_videos(
+                            aid, ah, sess, target, page_size=page_sz,
+                            offset_id=offset, search_query=search_q, expand_topics=False,
+                        ),
+                    )
+                    if status != "SUCCESS":
+                        break
+                    collected_v = _merge_videos(collected_v, payload)
+                    offset = nxt
+                    if not fetch_all or nxt == 0:
+                        break
+
+                if status == "SUCCESS":
+                    state["found_videos"] = collected_v
+                    state["scan_offset_id"] = offset
+                    state["scan_has_more"] = not fetch_all and offset != 0
+                    add_recent_group(target)
+                    _render_recent_groups()
+                    ui.notify(f"Found {len(collected_v)} video(s).", type="positive", position="top-right")
+                elif status == "AUTH_NEEDED":
+                    ui.notify("Run `python login.py` to authenticate.", type="warning", position="top-right")
+                else:
+                    ui.notify(f"Scan error: {payload}", type="negative", position="top-right")
+
+            finally:
+                scan_btn.props(remove="loading")
+                scan_all_btn.props(remove="loading")
+                _render_inv()
+
+        _render_inv()
+
+
+ui.run(
+    title="VibeTGVideoDownloader",
+    favicon="🎬",
+    port=8080,
+    dark=True,
+    reload=True,
+)
