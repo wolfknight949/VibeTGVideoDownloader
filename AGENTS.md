@@ -4,7 +4,31 @@
 
 This file is for coding agents and automated maintainers working in this repository.
 
-The project is a NiceGUI Telegram video downloader with a strict split between presentation logic (`app.py`) and backend operational logic (`telegram_backend.py`).
+The project is a NiceGUI Telegram video downloader with a split between presentation logic and backend operational logic.
+
+---
+
+## Repository Structure
+
+```text
+TelegramVideoDownloader/
+├── app.py                      # NiceGUI presentation layer
+├── telegram_backend/           # Backend service package
+│   ├── __init__.py             # Re-exports all public symbols
+│   ├── client.py               # TelegramClient creation, session management
+│   ├── downloader.py           # Parallel chunk + file download, background worker
+│   ├── filesystem.py           # Path helpers, sanitization, file scanning
+│   ├── scanner.py              # Scan/fetch functions, video metadata parsing
+│   └── state.py                # App state, queue, recent groups, build_posts
+├── ui/                         # UI sub-modules
+│   ├── api_routes.py           # FastAPI /api/download-file, /api/download-folder
+│   ├── helpers.py              # Pure UI helpers (formatting, grouping, merging)
+│   └── theme.py                # Colour palette constants and global CSS
+├── login.py                    # One-time Telegram authorization helper
+├── pyproject.toml              # Project metadata and pinned dependencies
+├── .env.example                # Credential template
+└── sessions/                   # Telegram session files (gitignored, auto-created)
+```
 
 ---
 
@@ -19,28 +43,35 @@ It should own:
 - scan form rendering and recent-groups UI
 - download monitor rendering (timer-based, not page-reload-based)
 - inventory rendering with topic/hashtag/resolution filters
-- UI-only helpers (post title formatting, checkbox aggregation, `_format_eta`)
 - calling backend functions and writing to the shared `state` dict
+
+It imports UI helpers from `ui.helpers`, theme constants from `ui.theme`, and registers API routes by importing `ui.api_routes`.
 
 It must not re-implement Telegram orchestration, queue management, filesystem logic, or chunk download behavior.
 
-### `telegram_backend.py` — service layer
+### `telegram_backend/` — service package
 
-It should own:
+All symbols previously in `telegram_backend.py` are re-exported from `telegram_backend/__init__.py` — existing `from telegram_backend import ...` calls in `app.py` work unchanged.
 
-- Telegram client creation (`create_telegram_client`, `prepare_client_session`)
-- derived session management — scan uses `__scan`, each parallel download slot uses `__download_0`, `__download_1`, etc.
-- session-state default structures (`create_app_state`, `ensure_session_defaults`, `reset_scan_state`, `default_download_progress`)
-- filesystem safety helpers (`safe_abs_path`, `sanitize_filename`)
-- scan and pagination via Telethon (`fetch_forum_topics`, `fetch_topic_videos`, `fetch_group_videos`)
-- queue and progress bookkeeping (`queue_downloads`, `set_task_status`, `sync_progress_summary`, `remove_from_queue`)
-- resumable partial file detection (`scan_incomplete_downloads`, `filter_completed_incomplete`, `filter_visible_incomplete`)
-- parallel chunk download logic (`download_video_parallel`)
-- in-place partial download finalization inside `download_selected_chunks`
-- background worker lifecycle (`start_download_worker`)
-- recent groups persistence (`load_recent_groups`, `save_recent_groups`, `add_recent_group`, `remove_recent_group`)
+| Module | Owns |
+|--------|------|
+| `client.py` | `create_telegram_client`, `prepare_client_session`, `resolve_group_title`, `sessions/` dir creation |
+| `scanner.py` | `fetch_forum_topics`, `fetch_topic_videos`, `fetch_group_videos`, `build_video_record` |
+| `downloader.py` | `download_video_parallel`, `download_selected_chunks`, `start_download_worker` |
+| `filesystem.py` | `safe_abs_path`, `sanitize_filename`, `scan_incomplete_downloads`, `scan_downloaded_files`, path builders |
+| `state.py` | `create_app_state`, `queue_downloads`, `build_posts`, `apply_downloaded_flags`, recent groups, progress helpers |
 
-If the change affects Telegram behavior, queueing, storage guarantees, resume semantics, or download orchestration, it belongs here.
+If the change affects Telegram behavior, queueing, storage guarantees, resume semantics, or download orchestration, it belongs in `telegram_backend/`.
+
+### `ui/` — UI sub-modules
+
+| Module | Owns |
+|--------|------|
+| `theme.py` | `BG`, `CARD`, `SURFACE`, `BORDER`, `TEXT`, `MUTED`, `DIM`, `BLUE`, `GREEN`, `RED`, `YELLOW`, `PURPLE`, `ORANGE`, `CSS` |
+| `helpers.py` | `get_post_title`, `format_eta`, `topic_label_of`, `group_by_topic`, `topic_targets`, `checked_targets(posts, post_selections)`, `merge_videos`, `merge_topics`, `has_cursor`, `mark_loaded(state, topic_id)` |
+| `api_routes.py` | FastAPI route handlers registered on `nicegui_app` |
+
+`app.py` imports these under private aliases (`_BG`, `_CSS`, `_checked_targets`, etc.) so internal call sites are unchanged.
 
 ---
 
@@ -54,6 +85,7 @@ Do not regress these behaviors:
 - Pagination must continue using the same loaded search query.
 - Download paths must stay inside the repository root (`_SAFE_ROOT`).
 - Base and derived session files plus `.env` values must never be committed.
+- Session files live in `sessions/` — `client.py` creates the directory automatically before Telethon opens any session.
 - Scan and download clients must use separate derived session files — scan uses `__scan`, each parallel download slot uses `__download_<n>` — to avoid SQLite `database is locked` errors.
 
 ---
@@ -82,7 +114,7 @@ Do not regress these behaviors:
 5. If batch size = 1, the single task runs inline (one `asyncio.run` call).
 6. If batch size > 1, each task runs in its own `threading.Thread` with its own `asyncio.run` and its own slot-indexed session (`__download_0`, `__download_1`, etc.).
 7. `download_selected_chunks(...)` downloads into `downloads/.../<filename>.part`.
-8. `on_progress` inside `download_selected_chunks` updates `per_file_progress[str(task_id)]` with per-file bytes/speed, then aggregates into top-level `bytes_done`/`bytes_total`/`speed_mbps` on the progress state.
+8. `on_progress` updates `per_file_progress[str(task_id)]` with per-file bytes/speed, then aggregates into top-level `bytes_done`/`bytes_total`/`speed_mbps`.
 9. On terminal state (done / skipped / stopped / error) the task's entry is removed from `per_file_progress`.
 10. Resume metadata is stored in `downloads/.../<filename>.meta.json`.
 11. File is renamed to the final filename in place only after full size verification.
@@ -127,7 +159,7 @@ Module-level `state = create_app_state()` — plain dict. Key sections:
 ## NiceGUI UI Patterns
 
 - **Monitor refresh**: `ui.timer(0.5, _render_monitor, active=False)` — activated when a download starts, paused when idle. The monitor container is cleared and rebuilt on each tick.
-- **Expansion state persistence**: mutable cell dict + `exp.on("update:model-value", lambda e: cell.__setitem__("key", bool(e.args)))` + `value=cell["key"]` in constructor. Used for `_files_state["open"]`, `_monitor_state["queue_open"]`, `_monitor_state["incomplete_open"]`.
+- **Expansion state persistence**: mutable cell dict + `exp.on("update:model-value", lambda e: cell.__setitem__("key", bool(e.args)))` + `value=cell["key"]` in constructor.
 - **Inventory rebuild**: `inventory_container.clear()` + re-render. Called after scan, topic load, or download queue change.
 - **Async Telegram I/O**: `await run.io_bound(asyncio.run, coro)` keeps the NiceGUI event loop unblocked.
 - **Notifications**: `ui.notify(msg, type='positive'|'negative'|'warning'|'info')`.
@@ -152,10 +184,10 @@ NiceGUI awaits the returned coroutine with full client context automatically.
 - Stored in `recent_groups.json` at project root.
 - JSON array of `{"handle": str, "display_name": str, "last_used": ISO str}`.
 - Max 20 entries (`MAX_RECENT_GROUPS`), newest first.
-- `add_recent_group(target)` is called **only** on successful scan — groups are never removed on failure.
+- `add_recent_group(target)` is called **only** on successful scan.
 - Only the user can remove a group (via the ✕ chip button in the scan card).
-- Backend functions: `load_recent_groups`, `save_recent_groups`, `add_recent_group`, `remove_recent_group`.
-- UI: `_render_recent_groups()` closure in `app.py` renders pill chips below the scan button row.
+- Backend functions: `load_recent_groups`, `add_recent_group`, `remove_recent_group` (in `telegram_backend/state.py`).
+- UI: `_render_recent_groups()` closure in `app.py`.
 
 ---
 
@@ -164,20 +196,19 @@ NiceGUI awaits the returned coroutine with full client context automatically.
 ### Resolution filters (`topic_res_filters`)
 
 - State key: `state["topic_res_filters"]` — dict of `topic_id (int) → set of resolution strings` (e.g. `{"1080p", "720p"}`).
-- Resolutions are extracted from video metadata height or filename hints via `_RESOLUTION_HINT_RE`.
+- Resolutions are extracted from video metadata height or filename hints via `_RESOLUTION_HINT_RE` in `scanner.py`.
 - Helper functions in `app.py`: `_trf(tid)`, `_toggle_trf(tid, res)`, `_clear_trf(tid)`.
 
 ### Hashtag filters (`topic_hashtag_filters`)
 
 - State key: `state["topic_hashtag_filters"]` — dict of `topic_id (int) → set of hashtag strings` (e.g. `{"#sport", "#news"}`).
-- Hashtags extracted from `post["description"]` text via `_HASHTAG_RE = re.compile(r"#\w+")`.
+- Hashtags extracted from `post["description"]` via `extract_hashtags()` in `ui/helpers.py`.
 - Helper functions in `app.py`: `_thf(tid)`, `_toggle_thf(tid, tag)`, `_clear_thf(tid)`, `_clear_all_filters(tid)`.
 
 ### Filter row rendering
 
 - `_topic_filter_row(topic_id, topic_posts)` renders both rows in the topic header.
 - Active filter buttons: bold, checkmark prefix, colored glow border (blue for resolution, violet for hashtag).
-- Inactive buttons: dim surface background.
 - A `🔍 Filters active` badge appears on the topic container when any filter is on.
 
 Both filter dicts are reset in `_clear_scan()` and `_do_scan()`.
@@ -192,7 +223,22 @@ Both filter dicts are reset in `_clear_scan()` and `_do_scan()`.
 - Batch > 1: each task gets `threading.Thread(target=lambda: asyncio.run(download_selected_chunks(..., slot=n)))`.
 - The `slot` param causes `prepare_client_session` to derive `__download_0`, `__download_1`, etc. — separate SQLite files, no locking.
 - All slot threads are `join()`ed before the next batch iteration.
-- UI reads `n_active` from `sum(1 for t in queue if t["status"] == "downloading")` — not from `len(per_file_progress)`.
+
+---
+
+## Session File Layout
+
+Session files are stored under `sessions/` (gitignored). `client.py` calls `_ensure_session_dir()` before creating any Telethon client, so the directory is created automatically.
+
+```text
+sessions/
+├── tg_parser_session.session          # base session (created by login.py)
+├── tg_parser_session__scan.session    # derived scan session
+├── tg_parser_session__download_0.session
+└── tg_parser_session__download_1.session
+```
+
+Derived sessions are copied from the base session on first use and are reused on subsequent runs.
 
 ---
 
@@ -212,7 +258,7 @@ Both filter dicts are reset in `_clear_scan()` and `_do_scan()`.
 Primary validation command:
 
 ```bash
-source venv/bin/activate && python -m py_compile app.py telegram_backend.py
+source venv/bin/activate && python -m py_compile app.py telegram_backend/filesystem.py telegram_backend/state.py telegram_backend/client.py telegram_backend/scanner.py telegram_backend/downloader.py telegram_backend/__init__.py ui/theme.py ui/helpers.py ui/api_routes.py
 ```
 
 Manual validation command:
@@ -240,19 +286,22 @@ Use manual validation when changing:
 | Problem | Start here |
 |---------|-----------|
 | UI/layout issue | `app.py` |
-| Scan or search issue | `telegram_backend.py` → `fetch_group_videos` |
-| Forum topics issue | `telegram_backend.py` → `fetch_forum_topics`, `fetch_topic_videos` |
-| Download placement, resume, or partial-file issue | `telegram_backend.py` → `download_selected_chunks`, `start_download_worker` |
-| Parallel download or session locking | `telegram_backend.py` → `start_download_worker`, `prepare_client_session` |
+| Theme or CSS issue | `ui/theme.py` |
+| Pure UI helper (formatting, grouping) | `ui/helpers.py` |
+| File-download API endpoint | `ui/api_routes.py` |
+| Scan or search issue | `telegram_backend/scanner.py` → `fetch_group_videos` |
+| Forum topics issue | `telegram_backend/scanner.py` → `fetch_forum_topics`, `fetch_topic_videos` |
+| Download placement, resume, or partial-file issue | `telegram_backend/downloader.py` → `download_selected_chunks`, `start_download_worker` |
+| Parallel download or session locking | `telegram_backend/downloader.py` → `start_download_worker`; `telegram_backend/client.py` → `prepare_client_session` |
+| Path safety or file scanning | `telegram_backend/filesystem.py` |
+| App state, queue, recent groups | `telegram_backend/state.py` |
 | Filter rendering | `app.py` → `_topic_filter_row`, `_filtered_targets`, `_render_post` |
-| Recent groups | `telegram_backend.py` → `add_recent_group`; `app.py` → `_render_recent_groups` |
-| Authentication | `login.py` |
+| Authentication / session creation | `login.py`, `telegram_backend/client.py` |
 
 ---
 
 ## Known Gaps
 
 - No automated test suite yet.
-- No committed `.env.example` yet.
 - Validation is primarily compile-check plus manual verification.
 

@@ -1,4 +1,5 @@
 # Telegram session files — contain auth tokens, NEVER commit these
+# Sessions live in sessions/ — *.session matches them at any depth
 *.session
 *.session-journal
 

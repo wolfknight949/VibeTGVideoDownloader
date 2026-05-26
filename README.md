@@ -11,12 +11,16 @@ A NiceGUI web app for browsing, filtering, and downloading videos from Telegram 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ### 2. Create `.env`
 
-Get values from [my.telegram.org/apps](https://my.telegram.org/apps):
+Copy the provided template and fill in your values from [my.telegram.org/apps](https://my.telegram.org/apps):
+
+```bash
+cp .env.example .env
+```
 
 ```env
 TG_API_ID=12345678
@@ -29,7 +33,7 @@ TG_API_HASH=abcdef1234567890abcdef1234567890
 python login.py
 ```
 
-This creates `tg_parser_session.session`. Keep it secret — it grants full account access.
+This creates `sessions/tg_parser_session.session`. Keep it secret — it grants full account access.
 
 ### 4. Run the app
 
@@ -48,7 +52,7 @@ Opens at [http://localhost:8080](http://localhost:8080).
 ### Left drawer — Connection Config
 
 - **API ID / API Hash** — loaded from `.env` automatically.
-- **Session Profile Name** — defaults to `tg_parser_session`. Change only if managing multiple Telegram accounts.
+- **Session Profile Name** — defaults to `sessions/tg_parser_session`. Change only if managing multiple Telegram accounts.
 
 ### Left drawer — Download Settings
 
@@ -111,14 +115,26 @@ Opens at [http://localhost:8080](http://localhost:8080).
 
 ```text
 TelegramVideoDownloader/
-├── app.py                 # NiceGUI presentation layer
-├── telegram_backend.py    # Telegram, download, filesystem, queue, and state logic
-├── login.py               # One-time Telegram authorization helper
-├── requirements.txt
-├── recent_groups.json     # Persisted recent group handles (auto-created)
-├── downloads/             # Completed files, *.part partials, *.meta.json metadata
-├── .env                   # Local secrets — never commit
-└── venv/                  # Local virtualenv — never commit
+├── app.py                      # NiceGUI presentation layer
+├── telegram_backend/           # Backend service package
+│   ├── __init__.py             # Re-exports all public symbols
+│   ├── client.py               # TelegramClient creation and session management
+│   ├── downloader.py           # Parallel chunk + file download, background worker
+│   ├── filesystem.py           # Path helpers, sanitization, file scanning
+│   ├── scanner.py              # Telegram scan/fetch functions, video metadata
+│   └── state.py                # App state, queue management, recent groups
+├── ui/                         # UI sub-modules (extracted from app.py)
+│   ├── api_routes.py           # FastAPI /api/download-file and /api/download-folder
+│   ├── helpers.py              # Pure UI helpers (formatting, grouping, merging)
+│   └── theme.py                # Colour palette and global CSS
+├── login.py                    # One-time Telegram authorization helper
+├── pyproject.toml              # Project metadata and dependencies
+├── .env.example                # Credential template — copy to .env
+├── sessions/                   # Telegram session files (gitignored)
+├── recent_groups.json          # Persisted recent group handles (auto-created)
+├── downloads/                  # Completed files, *.part partials, *.meta.json metadata
+├── .env                        # Local secrets — never commit
+└── venv/                       # Local virtualenv — never commit
 ```
 
 ---
@@ -134,17 +150,34 @@ All download state lives inside `downloads/`:
 
 A file is considered complete **only** when the final filename exists without a `.part` or `.meta.json` sibling.
 
+Session files live in `sessions/` and are never committed. The `__scan` and `__download_<n>` derived slots are created automatically inside the same folder from the base session.
+
 ---
 
 ## Architecture
 
 ### `app.py` — presentation layer
 
-Owns layout, NiceGUI wiring, scan form, download monitor, inventory rendering, and all UI-only helpers. Calls backend functions and writes to the shared `state` dict.
+Owns layout, NiceGUI wiring, scan form, download monitor, inventory rendering, and calling backend functions. Extracts theme constants, pure helpers, and API routes into `ui/`.
 
-### `telegram_backend.py` — service layer
+### `telegram_backend/` — service package
 
-Owns Telegram client creation, derived session management, scan and pagination via Telethon, queue and progress bookkeeping, resumable partial file detection, parallel chunk and parallel file download logic, and background worker lifecycle.
+| Module | Responsibility |
+|--------|---------------|
+| `client.py` | `TelegramClient` creation, derived session preparation, `sessions/` directory creation |
+| `scanner.py` | `fetch_forum_topics`, `fetch_topic_videos`, `fetch_group_videos`, video metadata parsing |
+| `downloader.py` | Parallel chunk download, `download_selected_chunks`, `start_download_worker` |
+| `filesystem.py` | Path safety (`safe_abs_path`), filename sanitization, file/metadata scanning |
+| `state.py` | `create_app_state`, queue management, recent groups, `build_posts`, progress helpers |
+| `__init__.py` | Re-exports all public symbols for backward-compatible `from telegram_backend import ...` |
+
+### `ui/` — UI sub-modules
+
+| Module | Responsibility |
+|--------|---------------|
+| `theme.py` | Color palette constants and global CSS string |
+| `helpers.py` | Pure helper functions: `get_post_title`, `format_eta`, `checked_targets`, `merge_videos`, etc. |
+| `api_routes.py` | FastAPI routes `/api/download-file` and `/api/download-folder` |
 
 For implementation guidance aimed at coding agents, see `AGENTS.md`.
 
@@ -152,7 +185,7 @@ For implementation guidance aimed at coding agents, see `AGENTS.md`.
 
 ## Troubleshooting
 
-**Missing credentials / zero API ID** — create or fix `.env`.
+**Missing credentials / zero API ID** — create or fix `.env` (copy from `.env.example`).
 
 **Authentication needed** — run `python login.py`. Derived scan/download sessions are recreated from the base session automatically if missing.
 
@@ -169,7 +202,7 @@ For implementation guidance aimed at coding agents, see `AGENTS.md`.
 ## Security Notes
 
 - Never commit `.env`.
-- Never commit `*.session` files.
+- Never commit `*.session` files — they are stored in `sessions/` which is gitignored.
 - All session files (base + derived) grant full Telegram account access.
 - Filenames are sanitized before use.
 - Output paths are restricted to the repository root.
@@ -178,7 +211,6 @@ For implementation guidance aimed at coding agents, see `AGENTS.md`.
 
 ## Known Gaps
 
-- No committed `.env.example` yet.
 - No automated test suite yet.
 - Validation is compile-check plus manual verification.
 

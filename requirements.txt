@@ -1,5 +1,0 @@
-nicegui>=1.4.0
-telethon==1.35.0
-cryptg
-cryptography==42.0.5
-python-dotenv==1.0.1

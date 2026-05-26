@@ -16,11 +16,12 @@ if not API_ID or not API_HASH:
     )
 
 print("Starting one-time Telegram login activation...")
-client = TelegramClient('tg_parser_session', API_ID, API_HASH)
+client = TelegramClient('sessions/tg_parser_session', API_ID, API_HASH)
 
 async def main():
-    # This automatically triggers the terminal prompt for your phone and OTP code
     print("Success! Your session is authorized and saved.")
 
+# The `with client:` block calls client.start() implicitly, which prompts for
+# phone number and OTP in the terminal.  main() runs after auth completes.
 with client:
     client.loop.run_until_complete(main())

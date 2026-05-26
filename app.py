@@ -1,14 +1,9 @@
 import asyncio
-import io
 import os
-import re
 import urllib.parse
-import zipfile
-from typing import Optional
 
+import ui.api_routes  # noqa: F401 — registers /api/* routes
 from dotenv import load_dotenv
-from fastapi.responses import FileResponse
-from nicegui import app as nicegui_app
 from nicegui import run, ui
 
 from telegram_backend import (
@@ -34,62 +29,39 @@ from telegram_backend import (
     scan_downloaded_files,
     scan_incomplete_downloads,
     start_download_worker,
-    _is_system_file,
+    is_system_file,
+)
+from ui.helpers import (
+    checked_targets as _checked_targets,
+    extract_hashtags as _extract_hashtags,
+    format_eta as _format_eta,
+    get_post_title as _get_post_title,
+    group_by_topic as _group_by_topic,
+    has_cursor as _has_cursor,
+    mark_loaded as _mark_loaded,
+    merge_topics as _merge_topics,
+    merge_videos as _merge_videos,
+    topic_label_of as _topic_label_of,
+    topic_targets as _topic_targets,
+)
+from ui.theme import (
+    BG as _BG,
+    BLUE as _BLUE,
+    BORDER as _BORDER,
+    CARD as _CARD,
+    CSS as _CSS,
+    DIM as _DIM,
+    GREEN as _GREEN,
+    MUTED as _MUTED,
+    ORANGE as _ORANGE,
+    PURPLE as _PURPLE,
+    RED as _RED,
+    SURFACE as _SURFACE,
+    TEXT as _TEXT,
+    YELLOW as _YELLOW,
 )
 
 load_dotenv()
-
-
-# ── File-download endpoint ───────────────────────────────────────────────────
-@nicegui_app.get("/api/download-file")
-async def _api_download_file(rel_path: str, dl_dir: str = DEFAULT_DOWNLOADS_DIR):
-    try:
-        abs_dir  = safe_abs_path(dl_dir)
-        abs_path = safe_abs_path(os.path.join(abs_dir, rel_path))
-    except ValueError:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=403, detail="Forbidden")
-    if not os.path.isfile(abs_path):
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(
-        abs_path,
-        filename=os.path.basename(abs_path),
-        media_type="application/octet-stream",
-    )
-
-
-@nicegui_app.get("/api/download-folder")
-async def _api_download_folder(folder: str, dl_dir: str = DEFAULT_DOWNLOADS_DIR):
-    from fastapi import HTTPException
-    from fastapi.responses import StreamingResponse
-    try:
-        abs_dir        = safe_abs_path(dl_dir)
-        abs_folder     = safe_abs_path(os.path.join(abs_dir, folder)) if folder else abs_dir
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    if not os.path.isdir(abs_folder):
-        raise HTTPException(status_code=404, detail="Folder not found")
-
-    def _iter_zip():
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-            for root, _, files in os.walk(abs_folder):
-                for fname in sorted(files):
-                    if fname.endswith(".meta.json") or fname.endswith(".part") or _is_system_file(fname):
-                        continue
-                    full = os.path.join(root, fname)
-                    arcname = os.path.relpath(full, abs_folder)
-                    zf.write(full, arcname)
-        buf.seek(0)
-        yield from iter(lambda: buf.read(1024 * 1024), b"")
-
-    zip_name = (os.path.basename(abs_folder) or "downloads") + ".zip"
-    return StreamingResponse(
-        _iter_zip(),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
-    )
 
 _ENV_API_ID  = int(os.environ.get("TG_API_ID", "0"))
 _ENV_API_HASH = os.environ.get("TG_API_HASH", "")
@@ -97,201 +69,6 @@ _ENV_API_HASH = os.environ.get("TG_API_HASH", "")
 state = create_app_state()
 post_selections: dict = {}
 expanded_topics: set = set()  # topic_ids currently expanded in the UI
-
-# ── Colour palette ──────────────────────────────────────────────────────────
-_BG       = "#0d1117"
-_CARD     = "#161b22"
-_SURFACE  = "#1c2128"
-_BORDER   = "#21262d"
-_TEXT     = "#e6edf3"
-_MUTED    = "#7d8590"
-_DIM      = "#484f58"
-_BLUE     = "#388bfd"
-_GREEN    = "#3fb950"
-_RED      = "#f85149"
-_YELLOW   = "#d29922"
-_PURPLE   = "#bc8cff"
-_ORANGE   = "#e3b341"
-
-_CSS = f"""
-html, body, .q-page {{ background:{_BG} !important; }}
-
-.q-header {{
-    background:#010409 !important;
-    border-bottom:1px solid {_BORDER};
-    box-shadow:none !important;
-}}
-
-.q-drawer {{
-    background:#010409 !important;
-    border-right:1px solid {_BORDER} !important;
-}}
-.q-drawer .q-separator {{ background:{_BORDER}; opacity:1; }}
-
-.q-card {{ background:{_CARD} !important; border:1px solid {_BORDER}; border-radius:10px !important; }}
-
-/* Expansion */
-.q-expansion-item {{
-    border:1px solid {_BORDER};
-    border-radius:8px !important;
-    overflow:hidden;
-    margin-bottom:2px;
-}}
-.q-expansion-item__container .q-item {{ background:{_SURFACE} !important; }}
-.q-expansion-item__container .q-expansion-item__content {{ background:{_CARD} !important; }}
-
-/* Inputs */
-.q-field--outlined .q-field__control::before {{ border-color:{_BORDER} !important; }}
-.q-field--outlined:hover .q-field__control::before {{ border-color:{_MUTED} !important; }}
-.q-field--outlined.q-field--focused .q-field__control::before {{ border-color:{_BLUE} !important; }}
-.q-field__label {{ color:{_MUTED} !important; }}
-.q-field__native, .q-field__input {{ color:{_TEXT} !important; }}
-.q-field__control {{ background:{_BG} !important; }}
-
-/* Progress */
-.q-linear-progress {{ border-radius:3px; overflow:hidden; }}
-.q-linear-progress__track {{ background:{_SURFACE} !important; }}
-.q-linear-progress__model {{ border-radius:3px; }}
-
-/* Scrollbar */
-::-webkit-scrollbar {{ width:5px; height:5px; }}
-::-webkit-scrollbar-track {{ background:transparent; }}
-::-webkit-scrollbar-thumb {{ background:{_BORDER}; border-radius:3px; }}
-
-/* App-specific */
-.section-lbl {{
-    font-size:0.6rem; font-weight:700; letter-spacing:.12em;
-    text-transform:uppercase; color:{_DIM};
-}}
-.dl-strip {{
-    background:{_SURFACE};
-    border:1px solid {_BORDER};
-    border-radius:8px;
-    padding:12px 16px;
-}}
-.post-row {{
-    width:100%;
-    box-sizing:border-box;
-    border-radius:6px;
-    padding:6px 10px;
-    border:1px solid {_BORDER};
-    background:{_SURFACE};
-    margin-bottom:4px;
-}}
-.q-expansion-item__container .q-expansion-item__content {{
-    padding:8px !important;
-    box-sizing:border-box;
-}}
-.video-row {{
-    border-radius:4px;
-    padding:3px 8px 3px 32px;
-    transition:background .12s;
-}}
-.video-row:hover {{ background:rgba(255,255,255,.04) !important; }}
-.chip {{
-    display:inline-flex; align-items:center;
-    padding:1px 7px; border-radius:12px;
-    font-size:.65rem; font-weight:600; white-space:nowrap;
-}}
-.chip-grey   {{ background:rgba(125,133,144,.12); color:{_MUTED}; border:1px solid rgba(125,133,144,.2); }}
-.chip-green  {{ background:rgba(63,185,80,.12);   color:{_GREEN};  border:1px solid rgba(63,185,80,.25); }}
-.chip-blue   {{ background:rgba(56,139,253,.12);  color:{_BLUE};   border:1px solid rgba(56,139,253,.25); }}
-.chip-red    {{ background:rgba(248,81,73,.12);   color:{_RED};    border:1px solid rgba(248,81,73,.25); }}
-.chip-orange {{ background:rgba(227,179,65,.12);  color:{_ORANGE}; border:1px solid rgba(227,179,65,.25); }}
-.topic-hdr {{
-    padding:8px 12px;
-    border-radius:6px;
-    background:{_SURFACE};
-    margin-bottom:2px;
-    cursor:pointer;
-}}
-"""
-
-
-# ── Pure helpers ────────────────────────────────────────────────────────────
-
-_HASHTAG_RE = re.compile(r"#\w+")
-
-
-def _extract_hashtags(text: str) -> list:
-    return _HASHTAG_RE.findall(text or "")
-
-
-def _get_post_title(post: dict) -> str:
-    if post.get("description"):
-        first_line = post["description"].splitlines()[0].strip()
-        if first_line:
-            return first_line.split(".", 1)[0].strip() or first_line
-    return post["videos"][0]["filename"]
-
-
-def _format_eta(secs: Optional[float]) -> str:
-    if secs is None or secs < 0:
-        return "--"
-    t = int(round(secs))
-    h, r = divmod(t, 3600)
-    m, s = divmod(r, 60)
-    if h:
-        return f"{h}h {m:02d}m"
-    if m:
-        return f"{m}m {s:02d}s"
-    return f"{s}s"
-
-
-def _topic_label_of(post: dict) -> str:
-    name = (post.get("topic_name") or "").strip()
-    tid  = post.get("topic_id", 0)
-    return name or (f"Topic #{tid}" if tid else "")
-
-
-def _group_by_topic(posts: dict) -> list:
-    buckets: dict = {}
-    for gid, post in posts.items():
-        buckets.setdefault(post.get("topic_id", 0), []).append((gid, post))
-    return list(buckets.items())
-
-
-def _topic_targets(topic_posts: list) -> list:
-    return [
-        v for _, p in topic_posts
-        if not p.get("downloaded")
-        for v in p["videos"]
-        if not v.get("downloaded")
-    ]
-
-
-def _checked_targets(posts: dict) -> list:
-    return [
-        v for gid, p in posts.items()
-        if post_selections.get(gid) and not p.get("downloaded")
-        for v in p["videos"]
-        if not v.get("downloaded")
-    ]
-
-
-def _merge_videos(existing: list, new: list) -> list:
-    ids = {v["id"] for v in existing}
-    return list(existing) + [v for v in new if v["id"] not in ids]
-
-
-def _merge_topics(existing: list, new: list) -> list:
-    m = {t["topic_id"]: dict(t) for t in existing}
-    for t in new:
-        e = dict(t)
-        e["loaded"] = m.get(t["topic_id"], {}).get("loaded", False) or t.get("loaded", False)
-        m[t["topic_id"]] = e
-    return sorted(m.values(), key=lambda t: (t.get("last_update_ts", ""), t.get("topic_id", 0)), reverse=True)
-
-
-def _has_cursor(c: dict) -> bool:
-    return bool((c or {}).get("offset_topic"))
-
-
-def _mark_loaded(topic_id: int) -> None:
-    for t in state["forum_topics"]:
-        if t.get("topic_id") == topic_id:
-            t["loaded"] = True
-            break
 
 
 # ── Page ─────────────────────────────────────────────────────────────────────
@@ -346,7 +123,7 @@ def main_page() -> None:
             .classes("w-full q-mb-sm")
         )
         session_input = (
-            ui.input("Session name", value="tg_parser_session")
+            ui.input("Session name", value="sessions/tg_parser_session")
             .props("outlined dense dark")
             .classes("w-full")
         )
@@ -394,7 +171,7 @@ def main_page() -> None:
     # ── Accessors ────────────────────────────────────────────────────────────
     def _aid()     -> int:  return int(api_id_input.value or 0)
     def _ahash()   -> str:  return (api_hash_input.value or "").strip()
-    def _sess()    -> str:  return (session_input.value or "tg_parser_session").strip()
+    def _sess()    -> str:  return (session_input.value or "sessions/tg_parser_session").strip()
     def _dlpath()  -> str:  return (downloads_input.value or DEFAULT_DOWNLOADS_DIR).strip()
     def _workers() -> int:  return int(chunks_slider.value)
     def _parallel_dl() -> int: return int(parallel_slider.value)
@@ -879,7 +656,7 @@ def main_page() -> None:
                 posts        = build_posts(videos)
                 apply_downloaded_flags(posts, dl_files)
                 all_v        = [v for p in posts.values() for v in p["videos"]]
-                sel          = _checked_targets(posts)
+                sel          = _checked_targets(posts, post_selections)
                 total        = sum(v["size_mb"] for v in all_v)
                 sel_mb       = sum(v["size_mb"] for v in sel)
                 loading_more = state.get("loading_more", False)
@@ -1321,7 +1098,7 @@ def main_page() -> None:
                 )
                 if status == "SUCCESS":
                     state["found_videos"] = _merge_videos(state["found_videos"], payload)
-                    _mark_loaded(tid)
+                    _mark_loaded(state, tid)
                     ui.notify(f'Loaded {len(payload)} video(s) from "{tlabel}".', type="positive", position="top-right")
                 elif status == "AUTH_NEEDED":
                     ui.notify("Run `python login.py` to authenticate.", type="warning", position="top-right")

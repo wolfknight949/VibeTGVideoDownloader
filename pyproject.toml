@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-video-downloader"
+version = "0.1.0"
+description = "NiceGUI Telegram video downloader"
+requires-python = ">=3.9"
+dependencies = [
+    "nicegui>=1.4.0",
+    "telethon==1.35.0",
+    "cryptg==0.5.2",
+    "cryptography==42.0.5",
+    "python-dotenv==1.0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["telegram_backend*", "ui*"]
