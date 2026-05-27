@@ -23,3 +23,7 @@ downloads/
 logs/
 *.log
 recent_groups.json
+
+# macOS metadata
+.DS_Store
+**/.DS_Store

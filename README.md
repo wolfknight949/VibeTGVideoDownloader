@@ -1,216 +1,202 @@
 # VibeTG — Telegram Video Downloader
 
-A NiceGUI web app for browsing, filtering, and downloading videos from Telegram groups, channels, and forum chats.
+A self-hosted web app that pulls videos out of Telegram groups, channels, and forum chats — faster than Telegram itself — and serves them directly to any device on your network, including iPhone and iPad.
 
 ---
 
-## Quick Start
+## Why VibeTG?
 
-### 1. Clone and set up the environment
+| Problem with Telegram | VibeTG solution |
+|---|---|
+| Telegram caps download speed on its own clients | Downloads directly over MTProto with parallel chunk streams — saturates your real connection |
+| You can only save one file at a time | Queue dozens of files; they download automatically one after another (or in parallel) |
+| Downloading a whole topic or post group takes forever | Select an entire topic or post with one click and queue everything at once |
+| Getting large videos onto iPhone/iPad is painful | Files land on your computer first, then you pull them over Wi-Fi right from the browser — no USB, no AirDrop, no iCloud |
+| Forum channels bury content across hundreds of topics | Filter by resolution and hashtag inside each topic before you download anything |
+| Interrupted downloads restart from zero | `.part` + `.meta.json` resume metadata means you pick up exactly where you left off |
+
+---
+
+## Requirements
+
+- Python 3.10+
+- A Telegram account
+- API credentials from [my.telegram.org/apps](https://my.telegram.org/apps) (free, takes 2 minutes)
+
+---
+
+## Setup
+
+### 1. Clone and install
 
 ```bash
+git clone https://github.com/your-username/TelegramVideoDownloader.git
+cd TelegramVideoDownloader
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -e .
 ```
 
-### 2. Create `.env`
-
-Copy the provided template and fill in your values from [my.telegram.org/apps](https://my.telegram.org/apps):
+### 2. Create your `.env` file
 
 ```bash
 cp .env.example .env
 ```
+
+Open `.env` and fill in your credentials from [my.telegram.org/apps](https://my.telegram.org/apps):
 
 ```env
 TG_API_ID=12345678
 TG_API_HASH=abcdef1234567890abcdef1234567890
 ```
 
-### 3. Authorize your Telegram account (once)
+### 3. Log in to Telegram (one-time)
 
 ```bash
 python login.py
 ```
 
-This creates `sessions/tg_parser_session.session`. Keep it secret — it grants full account access.
+Follow the prompts — enter your phone number and the code Telegram sends you. This creates a session file in `sessions/`. You only need to do this once.
 
-### 4. Run the app
+### 4. Start the app
 
 ```bash
 python app.py
 ```
 
-Opens at [http://localhost:8080](http://localhost:8080).
-
-> **Hot-reload** is enabled. Saving any Python file automatically restarts the server. In-memory state (scan results, download queue) resets on each reload — expected during development.
+Open **[http://localhost:8080](http://localhost:8080)** in your browser. That's it.
 
 ---
 
-## How to Use
+## Core Workflow
 
-### Left drawer — Connection Config
+### Step 1 — Point it at a group or channel
 
-- **API ID / API Hash** — loaded from `.env` automatically.
-- **Session Profile Name** — defaults to `sessions/tg_parser_session`. Change only if managing multiple Telegram accounts.
+Paste a username (`@channelname`), an invite link, or any chat reference into **Target Group** and click **Scan Group**.
 
-### Left drawer — Download Settings
+- Use **Scan All** to walk through the entire message history automatically.
+- Add a keyword in **Search Messages** to use Telegram's server-side search — useful for large channels.
+- Previously scanned groups are saved as chips for one-click access.
 
-- **Downloads Folder** — where completed files, `.part` partials, and `.meta.json` resume metadata are stored. Defaults to `downloads`.
-- **Parallel chunks per file** — simultaneous MTProto chunk streams per file. Safe range: 2–4.
-- **Parallel files** — how many files download at the same time (1–3). Each parallel file uses its own derived session slot to avoid SQLite locking. Default: 1.
+### Step 2 — Browse and filter
 
-### Scan Group
+For forum chats, results are grouped under collapsible topic sections. Inside each topic you can:
 
-1. Enter a group username, invite link, or chat reference in **Target Group**.
-2. Optionally type a **Search Messages** query (server-side, passed to Telegram directly).
-3. Set **Items** to control batch size (default 50).
-4. Click **Scan Group** for one batch, or **Scan All** to page until history is exhausted.
-5. **Recent groups** — successful scans save the group handle automatically. Click a saved chip to fill the input, or ✕ to remove it.
+- Filter by **video resolution** (blue buttons) — e.g. show only 1080p files.
+- Filter by **hashtag** (purple buttons) — e.g. show only posts tagged `#tutorial`.
+- Active filters are highlighted; a **Filters active** badge appears on the topic header.
 
-> Search is server-side. Changing the search text requires a new scan — existing results are not filtered locally.
+### Step 3 — Select and queue
 
-### Topic & Hashtag Filters
+- Tick individual videos, or tick a whole post to select every file in it.
+- Click **Download Selected** — everything goes into the download queue.
+- The queue processes automatically. You can add more items while downloads are running.
 
-- For forum chats, results are grouped under collapsed topic sections.
-- **Resolution filter** (blue buttons) — filter posts by detected video resolution within a topic.
-- **Hashtag filter** (purple buttons) — filter posts by hashtags found in message text within a topic.
-- Active filters show a bold checkmark prefix and a glowing border. A **🔍 Filters active** badge appears on the topic header.
-- **Clear Filters** removes all active filters for that topic.
+### Step 4 — Transfer to iPhone or iPad over Wi-Fi
 
-### Download Monitor
+Once a file (or an entire folder/topic) is on your computer, open VibeTG from **your phone's browser** using your computer's local IP — e.g. `http://192.168.1.10:8080`. Every completed file shows a download button. Tap it and the video saves straight to your camera roll or Files app.
 
-- Auto-refreshes every 0.5 s while downloads are active; idle otherwise.
-- Active strip shows filename (or "N files downloading in parallel"), aggregate speed, ETA, and a progress bar.
-- Each queued item shows live `XX% · Y.Y MB/s` while downloading.
-- **Stop** halts the background worker gracefully; partial files and metadata are preserved for resume.
-- **Resume All** re-queues all interrupted downloads found in `downloads/`.
+> **Why this is faster than AirDrop or Telegram:** The file is already fully on your computer. Your phone pulls it over local Wi-Fi at full LAN speed — typically 30–80 MB/s, far faster than anything Telegram's servers deliver.
 
-### Parsed Media Inventory
-
-- Videos are grouped into posts by Telegram `grouped_id`.
-- Posts are nested under collapsed topic sections.
-- Select individual videos or entire posts, then click **Download Selected**.
-- **Load more posts** continues pagination with the same search query.
-- **Load more topics** pages additional forum topic summaries.
+To download a whole topic as a single ZIP, use the folder download button next to any topic header.
 
 ---
 
-## Features
+## Download Settings
 
-- Telegram server-side search during scan
-- Forum chat support — lazy topic loading on demand
-- Hashtag filtering per topic
-- Resolution filtering per topic
-- Recent groups persistence (`recent_groups.json`)
-- Resumable downloads — `.part` + `.meta.json` survive interruption
-- Parallel chunk download per file (MTProto multi-stream)
-- Parallel file downloads (1–3 simultaneous files, each with its own session slot)
-- Per-file live progress in queue view
-- Hot-reload development mode
+All settings live in the **left drawer** under *Download Settings*.
+
+| Setting | What it does | Recommended |
+|---|---|---|
+| Downloads Folder | Where files are saved | Leave as `downloads` |
+| Parallel chunks per file | MTProto streams per file | 2–4 |
+| Parallel files | Files downloading at the same time | 1–2 |
+
+**Parallel chunks** is the biggest speed lever. Each chunk is an independent MTProto stream — more streams means higher throughput up to Telegram's per-account rate limit. Beyond 4 you risk hitting that limit and seeing speeds drop.
+
+**Parallel files** lets you download multiple different files simultaneously. Each uses its own derived session slot to avoid database conflicts.
 
 ---
 
-## Repository Layout
+## Download Monitor
 
-```text
-TelegramVideoDownloader/
-├── app.py                      # NiceGUI presentation layer
-├── telegram_backend/           # Backend service package
-│   ├── __init__.py             # Re-exports all public symbols
-│   ├── client.py               # TelegramClient creation and session management
-│   ├── downloader.py           # Parallel chunk + file download, background worker
-│   ├── filesystem.py           # Path helpers, sanitization, file scanning
-│   ├── scanner.py              # Telegram scan/fetch functions, video metadata
-│   └── state.py                # App state, queue management, recent groups
-├── ui/                         # UI sub-modules (extracted from app.py)
-│   ├── api_routes.py           # FastAPI /api/download-file and /api/download-folder
-│   ├── helpers.py              # Pure UI helpers (formatting, grouping, merging)
-│   └── theme.py                # Colour palette and global CSS
-├── login.py                    # One-time Telegram authorization helper
-├── pyproject.toml              # Project metadata and dependencies
-├── .env.example                # Credential template — copy to .env
-├── sessions/                   # Telegram session files (gitignored)
-├── recent_groups.json          # Persisted recent group handles (auto-created)
-├── downloads/                  # Completed files, *.part partials, *.meta.json metadata
-├── .env                        # Local secrets — never commit
-└── venv/                       # Local virtualenv — never commit
+The monitor strip at the top of the page shows:
+
+- Current filename (or "N files downloading in parallel")
+- Aggregate speed and ETA
+- A progress bar
+- Per-file `XX% · Y.Y MB/s` in the queue list
+
+**Stop** — halts the worker gracefully. Partial files are kept with their resume metadata.  
+**Resume All** — re-queues every interrupted download found in the `downloads/` folder.
+
+---
+
+## Resumable Downloads
+
+Every download writes two sidecar files alongside the actual content:
+
+- `<filename>.part` — the partial file data
+- `<filename>.meta.json` — message ID, chat, expected size, topic path
+
+If the app closes, your connection drops, or you hit Stop, the next Resume picks up from the last completed byte. No re-downloading from the start.
+
+---
+
+## Project Layout
+
 ```
-
----
-
-## Storage Semantics
-
-All download state lives inside `downloads/`:
-
-- `<filename>` — completed, size-verified file
-- `<filename>.part` — in-progress partial download
-- `<filename>.meta.json` — resume metadata (msg ID, chat, expected size, topic)
-- Topic subfolders mirror the forum structure when applicable
-
-A file is considered complete **only** when the final filename exists without a `.part` or `.meta.json` sibling.
-
-Session files live in `sessions/` and are never committed. The `__scan` and `__download_<n>` derived slots are created automatically inside the same folder from the base session.
-
----
-
-## Architecture
-
-### `app.py` — presentation layer
-
-Owns layout, NiceGUI wiring, scan form, download monitor, inventory rendering, and calling backend functions. Extracts theme constants, pure helpers, and API routes into `ui/`.
-
-### `telegram_backend/` — service package
-
-| Module | Responsibility |
-|--------|---------------|
-| `client.py` | `TelegramClient` creation, derived session preparation, `sessions/` directory creation |
-| `scanner.py` | `fetch_forum_topics`, `fetch_topic_videos`, `fetch_group_videos`, video metadata parsing |
-| `downloader.py` | Parallel chunk download, `download_selected_chunks`, `start_download_worker` |
-| `filesystem.py` | Path safety (`safe_abs_path`), filename sanitization, file/metadata scanning |
-| `state.py` | `create_app_state`, queue management, recent groups, `build_posts`, progress helpers |
-| `__init__.py` | Re-exports all public symbols for backward-compatible `from telegram_backend import ...` |
-
-### `ui/` — UI sub-modules
-
-| Module | Responsibility |
-|--------|---------------|
-| `theme.py` | Color palette constants and global CSS string |
-| `helpers.py` | Pure helper functions: `get_post_title`, `format_eta`, `checked_targets`, `merge_videos`, etc. |
-| `api_routes.py` | FastAPI routes `/api/download-file` and `/api/download-folder` |
-
-For implementation guidance aimed at coding agents, see `AGENTS.md`.
+TelegramVideoDownloader/
+├── app.py                    # NiceGUI UI — layout, scan form, download monitor
+├── telegram_backend/         # All backend logic
+│   ├── client.py             # Session management
+│   ├── scanner.py            # Telegram scan and metadata parsing
+│   ├── downloader.py         # Parallel chunk + file download engine
+│   ├── filesystem.py         # Path helpers and filename sanitization
+│   └── state.py              # App state, queue, recent groups
+├── ui/
+│   ├── api_routes.py         # /api/download-file and /api/download-folder endpoints
+│   ├── helpers.py            # Formatting and grouping utilities
+│   └── theme.py              # Color palette and global CSS
+├── login.py                  # One-time authorization helper
+├── pyproject.toml            # Dependencies
+├── .env.example              # Credential template
+├── sessions/                 # Session files (gitignored — never share these)
+├── downloads/                # Your downloaded files
+└── recent_groups.json        # Saved group handles (auto-managed)
+```
 
 ---
 
 ## Troubleshooting
 
-**Missing credentials / zero API ID** — create or fix `.env` (copy from `.env.example`).
+**"Missing credentials" or zero API ID**  
+Create or fix your `.env` file. Copy from `.env.example` and fill in your values from [my.telegram.org/apps](https://my.telegram.org/apps).
 
-**Authentication needed** — run `python login.py`. Derived scan/download sessions are recreated from the base session automatically if missing.
+**"Authentication needed"**  
+Run `python login.py`. Derived scan/download sessions are recreated from the base session automatically if missing.
 
-**Search appears stale** — search is server-side. Run a new scan after changing the query.
+**Search results look stale**  
+Search is processed by Telegram's servers, not locally. Run a new scan after changing the query.
 
-**File is `.part` + `.meta.json` but no final file** — download was interrupted. Use Resume in the monitor.
+**File stuck as `.part` with no final file**  
+The download was interrupted. Click **Resume All** in the monitor.
 
-**Downloads feel slow** — try increasing `Parallel chunks per file` (2–4). Beyond 4 risks Telegram rate-limits.
+**Downloads are slow**  
+Increase *Parallel chunks per file* to 3 or 4. Also check that nothing else is saturating your connection.
 
-**`database is locked` error** — each parallel file download uses its own derived session slot (`__download_0`, `__download_1`, etc.). If you see this, reduce `Parallel files` to 1.
+**`database is locked` error**  
+Reduce *Parallel files* to 1. Each parallel file needs its own session slot; the error means two workers collided on the same slot.
+
+**Can't reach the app from my phone**  
+Make sure your phone and computer are on the same Wi-Fi network. Find your computer's local IP (`ifconfig` on Mac/Linux, `ipconfig` on Windows) and open `http://<that-ip>:8080` on your phone.
 
 ---
 
 ## Security Notes
 
-- Never commit `.env`.
-- Never commit `*.session` files — they are stored in `sessions/` which is gitignored.
-- All session files (base + derived) grant full Telegram account access.
-- Filenames are sanitized before use.
-- Output paths are restricted to the repository root.
-
----
-
-## Known Gaps
-
-- No automated test suite yet.
-- Validation is compile-check plus manual verification.
-
+- Never commit `.env` — it contains your Telegram API credentials.
+- Never commit `sessions/*.session` — these files grant full access to your Telegram account.
+- Both directories are gitignored by default.
+- Filenames are sanitized before writing to disk.
+- File serving is restricted to the `downloads/` folder — no path traversal is possible.
