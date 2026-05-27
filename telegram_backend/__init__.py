@@ -39,6 +39,7 @@ from .state import (
     mark_unfinished_tasks,
     queue_downloads,
     remove_from_queue,
+    requeue_task,
     remove_recent_group,
     reset_scan_state,
     set_task_status,

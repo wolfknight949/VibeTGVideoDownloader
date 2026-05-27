@@ -200,13 +200,27 @@ def queue_downloads(progress_state, video_meta_list: list, default_chat: str = "
 
 
 def remove_from_queue(progress_state, task_id: int) -> bool:
-    """Remove a queued (not yet downloading) task by ID. Returns True if removed."""
+    """Remove a non-active task by ID (queued / stopped / error). Returns True if removed."""
     if progress_state is None:
         return False
+    removable = {"queued", "stopped", "error", "done", "skipped"}
     queue = progress_state.get("task_queue", [])
     for i, task in enumerate(queue):
-        if task.get("id") == task_id and task.get("status") == "queued":
+        if task.get("id") == task_id and task.get("status") in removable:
             queue.pop(i)
+            sync_progress_summary(progress_state)
+            return True
+    return False
+
+
+def requeue_task(progress_state, task_id: int) -> bool:
+    """Reset a stopped or error task back to queued. Returns True if found."""
+    if progress_state is None:
+        return False
+    for task in progress_state.get("task_queue", []):
+        if task.get("id") == task_id and task.get("status") in {"stopped", "error"}:
+            task["status"] = "queued"
+            task["error"] = ""
             sync_progress_summary(progress_state)
             return True
     return False

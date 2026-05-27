@@ -1,6 +1,9 @@
 import asyncio
 import os
 import urllib.parse
+import warnings
+
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 import ui.api_routes  # noqa: F401 — registers /api/* routes
 from dotenv import load_dotenv
@@ -27,6 +30,7 @@ from telegram_backend import (
     reset_scan_state,
     safe_abs_path,
     scan_downloaded_files,
+    requeue_task,
     scan_incomplete_downloads,
     start_download_worker,
     is_system_file,
@@ -230,8 +234,30 @@ def main_page() -> None:
 
                             for fitem in folder_files:
                                 indent = "padding-left:22px;" if folder else ""
-                                with ui.row().classes("w-full items-center gap-2 video-row").style(indent):
-                                    ui.icon("movie", size="13px").style(f"color:{_DIM}")
+                                _has_fthumb = bool(fitem.get("msg_id") and fitem.get("chat"))
+                                _frow_cls = (
+                                    "w-full items-center gap-2 video-row-thumb"
+                                    if _has_fthumb else
+                                    "w-full items-center gap-2 video-row"
+                                )
+                                with ui.row().classes(_frow_cls).style(indent):
+                                    if _has_fthumb:
+                                        _fq = urllib.parse.quote(fitem["chat"])
+                                        _sq = urllib.parse.quote(_sess())
+                                        (
+                                            ui.image(
+                                                f"/api/thumbnail?msg_id={fitem['msg_id']}"
+                                                f"&chat={_fq}&session={_sq}"
+                                            )
+                                            .props("no-spinner fit=cover")
+                                            .style(
+                                                "width:72px; min-width:72px; height:45px;"
+                                                " border-radius:3px; flex-shrink:0;"
+                                                f" background:{_CARD};"
+                                            )
+                                        )
+                                    else:
+                                        ui.icon("movie", size="13px").style(f"color:{_DIM}")
                                     ui.label(fitem["filename"]).style(
                                         f"font-family:monospace; font-size:.75rem; color:{_TEXT}; flex:1;"
                                         "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
@@ -357,7 +383,11 @@ def main_page() -> None:
 
         # ── Download monitor ────────────────────────────────────────────────
         monitor_wrap = ui.column().classes("w-full gap-2")
-        _monitor_state: dict = {"queue_open": True, "incomplete_open": True}
+        _monitor_state: dict = {"queue_open": True, "queue_sig": None}
+
+        with monitor_wrap:
+            active_strip_wrap = ui.column().classes("w-full")
+            queue_wrap        = ui.column().classes("w-full")
 
         def _upd_header(active: bool, spd: float) -> None:
             if active:
@@ -370,82 +400,83 @@ def main_page() -> None:
                     f'<span style="font-size:.75rem; color:{_DIM};">Idle</span>'
                 )
 
-        def _render_monitor() -> None:
+        def _render_active_strip() -> None:
+            """Rebuild only the live progress strip — called every 0.5 s."""
+            p      = state["download_progress"]
+            active = p.get("active", False)
+            spd    = p.get("speed_mbps", 0.0)
+            queue  = p.get("task_queue", [])
+            _upd_header(active, spd)
+            active_strip_wrap.clear()
+            if not active:
+                return
+            bd       = p.get("bytes_done", 0)
+            bt       = max(p.get("bytes_total", 1), 1)
+            fn       = p.get("filename", "…")
+            fi       = p.get("file_idx", 0)
+            ft       = max(p.get("total_files", 1), 1)
+            cd       = p.get("chunks_done", 0)
+            ct       = max(p.get("chunks_total", 1), 1)
+            eta      = max(bt - bd, 0) / (spd * 1048576) if spd > 0 else None
+            n_active = sum(1 for t in queue if t.get("status") == "downloading")
+            with active_strip_wrap:
+                with ui.element("div").classes("dl-strip"):
+                    with ui.row().classes("w-full items-center gap-2 q-mb-sm"):
+                        ui.icon("downloading", size="16px").style(f"color:{_BLUE}")
+                        if n_active > 1:
+                            ui.label(f"{n_active} files downloading in parallel").style(
+                                f"font-size:.82rem; font-weight:500; color:{_TEXT}; flex:1;"
+                            )
+                        else:
+                            ui.label(fn).style(
+                                f"font-size:.82rem; font-weight:500; color:{_TEXT}; flex:1;"
+                                "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                            )
+                        ui.label(f"File {fi+1}/{ft}").style(
+                            f"font-size:.72rem; color:{_MUTED}; white-space:nowrap;"
+                        )
+                        ui.label(f"⚡ {spd:.2f} MB/s").style(
+                            f"font-size:.72rem; color:{_ORANGE}; white-space:nowrap;"
+                        )
+                        ui.label(f"ETA {_format_eta(eta)}").style(
+                            f"font-size:.72rem; color:{_MUTED}; white-space:nowrap;"
+                        )
+                        ui.button(
+                            "Stop", icon="stop",
+                            on_click=_do_stop, color="negative",
+                        ).props("unelevated dense").style("min-height:28px; font-size:.72rem;")
+                    pct_f = bd / bt
+                    ui.label(
+                        f"{bd/1048576:.1f} / {bt/1048576:.1f} MB  ({pct_f*100:.0f}%)"
+                    ).style(f"font-size:.68rem; color:{_MUTED}; margin-bottom:3px;")
+                    ui.linear_progress(pct_f, color="blue-5", size="6px", show_value=False).classes("w-full q-mb-xs")
+                    if n_active <= 1:
+                        pct_b = cd / ct if ct else 0
+                        ui.label(f"Chunks {cd}/{ct}").style(
+                            f"font-size:.68rem; color:{_MUTED}; margin-bottom:3px;"
+                        )
+                        ui.linear_progress(pct_b, color="purple-4", size="4px", show_value=False).classes("w-full")
+
+        def _render_queue_list() -> None:
+            """Rebuild the queue + orphaned panel — called only when task statuses change."""
             dp       = _dlpath()
             p        = state["download_progress"]
             active   = p.get("active", False)
             dl_files = scan_downloaded_files(dp)
-            incomplete = filter_visible_incomplete(
-                p, filter_completed_incomplete(scan_incomplete_downloads(dp), dl_files)
-            )
-            queue     = p.get("task_queue", [])
-            done_cnt  = p.get("files_done", 0)
-            spd       = p.get("speed_mbps", 0.0)
+            all_inc  = filter_completed_incomplete(scan_incomplete_downloads(dp), dl_files)
+            queue    = p.get("task_queue", [])
+            done_cnt = p.get("files_done", 0)
 
-            _upd_header(active, spd)
-            monitor_wrap.clear()
-            with monitor_wrap:
+            queue_ids = {task.get("id") for task in queue}
+            inc_by_id = {i["msg_id"]: i for i in all_inc}
+            orphaned  = [i for i in all_inc if i.get("msg_id") not in queue_ids]
 
-                # ── Active progress strip ──────────────────────────────────
-                if active:
-                    bd  = p.get("bytes_done", 0)
-                    bt  = max(p.get("bytes_total", 1), 1)
-                    fn  = p.get("filename", "…")
-                    fi  = p.get("file_idx", 0)
-                    ft  = max(p.get("total_files", 1), 1)
-                    cd  = p.get("chunks_done", 0)
-                    ct  = max(p.get("chunks_total", 1), 1)
-                    fd  = done_cnt
-                    eta = max(bt - bd, 0) / (spd * 1048576) if spd > 0 else None
-                    pfp = p.get("per_file_progress", {})
-                    n_active = sum(1 for t in queue if t.get("status") == "downloading")
-
-                    with ui.element("div").classes("dl-strip"):
-                        with ui.row().classes("w-full items-center gap-2 q-mb-sm"):
-                            ui.icon("downloading", size="16px").style(f"color:{_BLUE}")
-                            if n_active > 1:
-                                ui.label(f"{n_active} files downloading in parallel").style(
-                                    f"font-size:.82rem; font-weight:500; color:{_TEXT}; flex:1;"
-                                )
-                            else:
-                                ui.label(fn).style(
-                                    f"font-size:.82rem; font-weight:500; color:{_TEXT}; flex:1;"
-                                    "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
-                                )
-                            ui.label(
-                                f"File {fi+1}/{ft}"
-                            ).style(f"font-size:.72rem; color:{_MUTED}; white-space:nowrap;")
-                            ui.label(
-                                f"⚡ {spd:.2f} MB/s"
-                            ).style(f"font-size:.72rem; color:{_ORANGE}; white-space:nowrap;")
-                            ui.label(
-                                f"ETA {_format_eta(eta)}"
-                            ).style(f"font-size:.72rem; color:{_MUTED}; white-space:nowrap;")
-                            ui.button(
-                                "Stop", icon="stop",
-                                on_click=_do_stop, color="negative",
-                            ).props("unelevated dense").style(
-                                "min-height:28px; font-size:.72rem;"
-                            )
-
-                        pct_f = bd / bt
-                        ui.label(
-                            f"{bd/1048576:.1f} / {bt/1048576:.1f} MB  ({pct_f*100:.0f}%)"
-                        ).style(f"font-size:.68rem; color:{_MUTED}; margin-bottom:3px;")
-                        ui.linear_progress(pct_f, color="blue-5", size="6px", show_value=False).classes("w-full q-mb-xs")
-
-                        if n_active <= 1:
-                            pct_b = cd / ct if ct else 0
-                            ui.label(
-                                f"Chunks {cd}/{ct}"
-                            ).style(f"font-size:.68rem; color:{_MUTED}; margin-bottom:3px;")
-                            ui.linear_progress(pct_b, color="purple-4", size="4px", show_value=False).classes("w-full")
-
-                # ── Idle / done / error banner ─────────────────────────────
-                elif done_cnt > 0 and not p.get("error"):
+            queue_wrap.clear()
+            with queue_wrap:
+                if not active and done_cnt > 0 and not p.get("error"):
                     with ui.row().classes("items-center gap-2").style(
-                        f"padding:8px 12px; background:{_SURFACE}; border:1px solid rgba(63,185,80,.2);"
-                        f"border-radius:8px;"
+                        f"padding:8px 12px; background:{_SURFACE};"
+                        f"border:1px solid rgba(63,185,80,.2); border-radius:8px;"
                     ):
                         ui.icon("check_circle", size="16px").style(f"color:{_GREEN}")
                         ui.label(
@@ -454,105 +485,186 @@ def main_page() -> None:
 
                 if p.get("error"):
                     with ui.row().classes("items-center gap-2").style(
-                        f"padding:8px 12px; background:{_SURFACE}; border:1px solid rgba(248,81,73,.2);"
-                        f"border-radius:8px;"
+                        f"padding:8px 12px; background:{_SURFACE};"
+                        f"border:1px solid rgba(248,81,73,.2); border-radius:8px;"
                     ):
                         ui.icon("error_outline", size="16px").style(f"color:{_RED}")
                         ui.label(p["error"]).style(f"font-size:.82rem; color:{_RED};")
 
-                # ── Queue ──────────────────────────────────────────────────
-                if queue:
-                    with ui.expansion(
-                        f"Queue  ({len(queue)} files)",
-                        value=_monitor_state["queue_open"],
-                    ).classes("w-full") as _q_exp:
-                        _q_exp.on("update:model-value", lambda e: _monitor_state.__setitem__("queue_open", bool(e.args)))
-                        with ui.column().classes("gap-1 q-pa-sm"):
-                            pfp = p.get("per_file_progress", {})
-                            for task in queue:
-                                tst = task.get("status", "queued")
-                                c   = {
-                                    "done": _GREEN, "downloading": _BLUE,
-                                    "error": _RED, "stopped": _YELLOW,
-                                    "skipped": _MUTED,
-                                }.get(tst, _MUTED)
-                                icon = TASK_STATUS_ICONS.get(tst, "•")
-                                with ui.row().classes("items-center gap-2"):
-                                    ui.label(icon).style(f"color:{c}; font-size:.82rem; width:16px;")
-                                    ui.label(task["filename"]).style(
-                                        f"color:{_TEXT}; font-size:.78rem; flex:1;"
-                                        "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
-                                    )
-                                    if tst == "downloading":
-                                        fp = pfp.get(str(task.get("id", "")), {})
-                                        if fp and fp.get("bytes_total", 0) > 0:
-                                            pct = fp["bytes_done"] / fp["bytes_total"] * 100
-                                            spd_f = fp.get("speed_mbps", 0.0)
-                                            ui.label(f"{pct:.0f}% · {spd_f:.1f} MB/s").style(
-                                                f"color:{_BLUE}; font-size:.7rem; white-space:nowrap;"
-                                            )
-                                        else:
-                                            ui.label("starting…").style(
-                                                f"color:{_MUTED}; font-size:.7rem; white-space:nowrap;"
-                                            )
-                                    else:
-                                        ui.label(f"{task.get('size_mb', 0)} MB").style(
-                                            f"color:{_DIM}; font-size:.7rem; white-space:nowrap;"
-                                        )
-                                    if tst == "queued":
-                                        ui.button(
-                                            icon="close",
-                                            on_click=lambda t=task: (
-                                                remove_from_queue(state["download_progress"], t["id"]),
-                                                _render_monitor(),
-                                            ),
-                                        ).props("flat round dense").tooltip("Remove from queue").style(
-                                            f"color:{_DIM}; width:24px;"
-                                        )
+                display_items = list(queue) + [
+                    {
+                        "id": i["msg_id"], "filename": i["filename"],
+                        "size_bytes": i.get("size_bytes") or i.get("total_size", 0),
+                        "size_mb": i.get("size_mb", 0), "date": i.get("date", ""),
+                        "chat": i.get("chat", ""), "topic_id": i.get("topic_id", 0),
+                        "topic_name": i.get("topic_name", ""),
+                        "status": "orphaned", "_inc": i,
+                    }
+                    for i in orphaned
+                ]
 
-                # ── Resume incomplete ──────────────────────────────────────
-                if incomplete:
-                    with ui.expansion(
-                        f"Interrupted  ({len(incomplete)})",
-                        value=_monitor_state["incomplete_open"],
-                    ).classes("w-full") as _inc_exp:
-                        _inc_exp.on("update:model-value", lambda e: _monitor_state.__setitem__("incomplete_open", bool(e.args)))
-                        with ui.column().classes("gap-2 q-pa-sm"):
-                            with ui.row().classes("items-center gap-2"):
+                if not display_items:
+                    return
+
+                o_count = len(orphaned)
+                header_label = (
+                    f"Queue  ({len(queue)} in queue, {o_count} from prev. session)"
+                    if o_count else f"Queue  ({len(queue)} files)"
+                )
+
+                with ui.expansion(
+                    header_label,
+                    value=_monitor_state["queue_open"],
+                ).classes("w-full") as _q_exp:
+                    _q_exp.on("update:model-value",
+                              lambda e: _monitor_state.__setitem__("queue_open", bool(e.args)))
+                    with ui.column().classes("gap-1 q-pa-sm"):
+                        stopped_tasks = [t for t in queue if t.get("status") == "stopped"]
+                        if stopped_tasks and not active:
+                            with ui.row().classes("items-center gap-2 q-mb-xs"):
                                 ui.button(
-                                    "Resume all", icon="play_arrow",
-                                    on_click=lambda i=incomplete, dlf=dl_files: _resume_all(i, dlf),
+                                    "Resume all stopped", icon="play_arrow",
+                                    on_click=lambda: _resume_all_stopped(),
                                 ).props("unelevated dense").style(
-                                    f"background:{_SURFACE}; color:{_GREEN}; border:1px solid rgba(63,185,80,.3);"
-                                    "font-size:.75rem;"
+                                    f"background:{_SURFACE}; color:{_GREEN};"
+                                    "border:1px solid rgba(63,185,80,.3); font-size:.75rem;"
                                 )
-                                ui.label(
-                                    f"{len(incomplete)} download(s) can be resumed"
-                                ).style(f"font-size:.75rem; color:{_MUTED};")
 
-                            for inc in incomplete:
-                                with ui.row().classes("items-center gap-2 video-row"):
-                                    ui.icon("insert_drive_file", size="14px").style(f"color:{_DIM}")
-                                    ui.label(inc["filename"]).style(
-                                        f"color:{_TEXT}; font-size:.78rem; flex:1;"
-                                        "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                        pfp = p.get("per_file_progress", {})
+                        for task in display_items:
+                            tst  = task.get("status", "queued")
+                            c    = {
+                                "done": _GREEN, "downloading": _BLUE, "error": _RED,
+                                "stopped": _YELLOW, "skipped": _MUTED, "orphaned": _ORANGE,
+                            }.get(tst, _MUTED)
+                            icon = {"orphaned": "⚠️", **TASK_STATUS_ICONS}.get(tst, "•")
+                            chat = task.get("chat", "")
+                            tid  = task.get("id")
+
+                            with ui.row().classes("items-center gap-2"):
+                                if chat and tid:
+                                    _tq  = urllib.parse.quote(chat)
+                                    _tsq = urllib.parse.quote(_sess())
+                                    ui.html(
+                                        f'<img src="/api/thumbnail?msg_id={tid}'
+                                        f'&chat={_tq}&session={_tsq}"'
+                                        f' style="width:44px;min-width:44px;height:28px;'
+                                        f'border-radius:3px;flex-shrink:0;object-fit:cover;'
+                                        f'background:{_CARD};"'
+                                        f' onerror="this.style.display=\'none\'">',
+                                        sanitize=False,
                                     )
-                                    ui.label(
-                                        f"{inc.get('_part_size_mb', 0)}/{inc.get('size_mb', '?')} MB"
-                                    ).style(f"color:{_DIM}; font-size:.7rem; white-space:nowrap;")
-                                    ui.button(icon="add", on_click=lambda i=inc, dlf=dl_files: _resume_one(i, dlf)
-                                    ).props("flat round dense").tooltip("Queue this file").style(
-                                        f"color:{_BLUE}"
+                                ui.label(icon).style(
+                                    f"color:{c}; font-size:.82rem; width:16px; flex-shrink:0;"
+                                )
+                                ui.label(task["filename"]).style(
+                                    f"color:{_TEXT}; font-size:.78rem; flex:1;"
+                                    "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                )
+
+                                if tst == "downloading":
+                                    fp = pfp.get(str(tid or ""), {})
+                                    if fp and fp.get("bytes_total", 0) > 0:
+                                        pct   = fp["bytes_done"] / fp["bytes_total"] * 100
+                                        spd_f = fp.get("speed_mbps", 0.0)
+                                        ui.label(f"{pct:.0f}% · {spd_f:.1f} MB/s").style(
+                                            f"color:{_BLUE}; font-size:.7rem; white-space:nowrap;"
+                                        )
+                                    else:
+                                        ui.label("starting…").style(
+                                            f"color:{_MUTED}; font-size:.7rem; white-space:nowrap;"
+                                        )
+
+                                elif tst == "stopped":
+                                    inc    = inc_by_id.get(tid, {})
+                                    dl_mb  = round(inc.get("bytes_downloaded", 0) / 1048576, 1)
+                                    tot_mb = task.get("size_mb", 0)
+                                    ui.label(f"{dl_mb}/{tot_mb} MB").style(
+                                        f"color:{_YELLOW}; font-size:.7rem; white-space:nowrap;"
                                     )
-                                    ui.button(icon="delete_outline", on_click=lambda i=inc: _delete_inc(i)
+                                    ui.button(icon="play_arrow",
+                                              on_click=lambda t=task: _resume_stopped(t)
+                                    ).props("flat round dense").tooltip("Resume").style(f"color:{_GREEN}")
+                                    ui.button(icon="delete_outline",
+                                              on_click=lambda t=task: _delete_task_and_partial(t, dp)
+                                    ).props("flat round dense").tooltip("Remove and delete partial file").style(
+                                        f"color:{_RED}"
+                                    )
+
+                                elif tst == "error":
+                                    ui.label((task.get("error") or "error")[:30]).style(
+                                        f"color:{_RED}; font-size:.65rem; white-space:nowrap;"
+                                        "max-width:120px; overflow:hidden; text-overflow:ellipsis;"
+                                    )
+                                    ui.button(icon="replay",
+                                              on_click=lambda t=task: _resume_stopped(t)
+                                    ).props("flat round dense").tooltip("Retry").style(f"color:{_ORANGE}")
+                                    ui.button(icon="close",
+                                              on_click=lambda t=task: (
+                                                  remove_from_queue(state["download_progress"], t["id"]),
+                                                  _render_queue_list(),
+                                              )
+                                    ).props("flat round dense").tooltip("Remove from queue").style(
+                                        f"color:{_DIM}; width:24px;"
+                                    )
+
+                                elif tst == "orphaned":
+                                    inc_item = task["_inc"]
+                                    dl_mb  = round(inc_item.get("bytes_downloaded", 0) / 1048576, 1)
+                                    tot_mb = task.get("size_mb", 0)
+                                    ui.label(f"{dl_mb}/{tot_mb} MB").style(
+                                        f"color:{_ORANGE}; font-size:.7rem; white-space:nowrap;"
+                                    )
+                                    ui.button(icon="play_arrow",
+                                              on_click=lambda i=inc_item: _resume_orphaned(i, dl_files)
+                                    ).props("flat round dense").tooltip("Resume download").style(
+                                        f"color:{_GREEN}"
+                                    )
+                                    ui.button(icon="delete_outline",
+                                              on_click=lambda i=inc_item: _delete_inc(i)
                                     ).props("flat round dense").tooltip("Delete partial file").style(
                                         f"color:{_RED}"
                                     )
 
+                                elif tst == "queued":
+                                    ui.label(f"{task.get('size_mb', 0)} MB").style(
+                                        f"color:{_DIM}; font-size:.7rem; white-space:nowrap;"
+                                    )
+                                    ui.button(icon="close",
+                                              on_click=lambda t=task: (
+                                                  remove_from_queue(state["download_progress"], t["id"]),
+                                                  _render_queue_list(),
+                                              )
+                                    ).props("flat round dense").tooltip("Remove from queue").style(
+                                        f"color:{_DIM}; width:24px;"
+                                    )
+
+                                else:  # done, skipped
+                                    ui.label(f"{task.get('size_mb', 0)} MB").style(
+                                        f"color:{_DIM}; font-size:.7rem; white-space:nowrap;"
+                                    )
+
+        def _render_monitor() -> None:
+            """Timer callback: refresh active strip every tick; queue only on state change."""
+            p   = state["download_progress"]
+            _render_active_strip()
+            sig = (
+                tuple(
+                    (t.get("id"), t.get("status"), t.get("error", ""))
+                    for t in p.get("task_queue", [])
+                ),
+                p.get("error"),
+                p.get("files_done", 0),
+                p.get("active", False),
+            )
+            if sig != _monitor_state["queue_sig"]:
+                _monitor_state["queue_sig"] = sig
+                _render_queue_list()
+
         def _do_stop() -> None:
             state["stop_event"].set()
             ui.notify("Stop signal sent.", type="warning", position="top-right", timeout=3000)
-            _render_monitor()
+            _render_active_strip()
 
         def _start_worker() -> None:
             state["stop_event"].clear()
@@ -563,24 +675,33 @@ def main_page() -> None:
             )
             monitor_timer.active = True
 
-        def _resume_all(incomplete: list, dl_files: list) -> None:
-            targets = [
-                {
-                    "id": i["msg_id"], "filename": i["filename"],
-                    "size_bytes": i.get("size_bytes") or i.get("total_size", 0),
-                    "size_mb": i.get("size_mb", 0), "date": i.get("date", ""),
-                    "chat": i.get("chat", ""), "topic_id": i.get("topic_id", 0),
-                    "topic_name": i.get("topic_name", ""),
-                }
-                for i in incomplete
-            ]
-            r = queue_downloads(state["download_progress"], targets, downloaded_files=dl_files)
-            if r["added"]:
-                _start_worker(); _render_monitor()
-            elif r["already_downloaded"]:
-                ui.notify("All already downloaded.", type="info", position="top-right")
+        def _resume_stopped(task: dict) -> None:
+            if requeue_task(state["download_progress"], task["id"]):
+                _start_worker()
+            _render_queue_list()
 
-        def _resume_one(inc: dict, dl_files: list) -> None:
+        def _resume_all_stopped() -> None:
+            dp = state["download_progress"]
+            for task in list(dp.get("task_queue", [])):
+                if task.get("status") == "stopped":
+                    requeue_task(dp, task["id"])
+            _start_worker()
+            _render_queue_list()
+
+        def _delete_task_and_partial(task: dict, dl_dir: str) -> None:
+            remove_from_queue(state["download_progress"], task["id"])
+            rel = task.get("download_rel_path") or task.get("filename", "")
+            try:
+                abs_dir = safe_abs_path(dl_dir)
+                for suffix in (".part", ".meta.json"):
+                    p_path = os.path.join(abs_dir, rel + suffix)
+                    if os.path.exists(p_path):
+                        os.remove(p_path)
+            except OSError:
+                pass
+            _render_queue_list()
+
+        def _resume_orphaned(inc: dict, dl_files_set) -> None:
             r = queue_downloads(
                 state["download_progress"],
                 [{
@@ -590,19 +711,22 @@ def main_page() -> None:
                     "chat": inc.get("chat", ""), "topic_id": inc.get("topic_id", 0),
                     "topic_name": inc.get("topic_name", ""),
                 }],
-                downloaded_files=dl_files,
+                downloaded_files=dl_files_set,
             )
             if r["added"]:
-                _start_worker(); _render_monitor()
+                _start_worker()
             elif r["already_downloaded"]:
                 ui.notify("Already downloaded.", type="info", position="top-right")
+            _render_queue_list()
 
         def _delete_inc(inc: dict) -> None:
             for path in (inc.get("_part_path", ""), inc.get("_meta_path", "")):
                 if path and os.path.exists(path):
-                    try: os.remove(path)
-                    except OSError: pass
-            _render_monitor()
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            _render_queue_list()
 
         _render_monitor()
         monitor_timer = ui.timer(
@@ -1054,11 +1178,35 @@ def main_page() -> None:
                     for vv in videos:
                         vdl = vv.get("downloaded", False)
                         res = vv.get("resolution", "")
-                        with ui.row().classes("w-full items-center gap-2 video-row"):
-                            ui.icon(
-                                "check_circle" if vdl else "play_circle_outline",
-                                size="13px",
-                            ).style(f"color:{_GREEN if vdl else _DIM}")
+                        _row_cls = (
+                            "w-full items-center gap-2 video-row"
+                            if vdl else
+                            "w-full items-center gap-2 video-row-thumb"
+                        )
+                        with ui.row().classes(_row_cls):
+                            if vdl:
+                                ui.icon("check_circle", size="13px").style(
+                                    f"color:{_GREEN}; flex-shrink:0;"
+                                )
+                            elif state.get("scan_loaded_group"):
+                                _chat_q = urllib.parse.quote(state.get("scan_loaded_group", ""))
+                                _sess_q = urllib.parse.quote(_sess())
+                                (
+                                    ui.image(
+                                        f"/api/thumbnail?msg_id={vv['id']}"
+                                        f"&chat={_chat_q}&session={_sess_q}"
+                                    )
+                                    .props("no-spinner fit=cover")
+                                    .style(
+                                        "width:88px; min-width:88px; height:55px;"
+                                        " border-radius:4px; flex-shrink:0;"
+                                        f" background:{_CARD};"
+                                    )
+                                )
+                            else:
+                                ui.icon("play_circle_outline", size="13px").style(
+                                    f"color:{_DIM}; flex-shrink:0;"
+                                )
                             ui.label(vv["filename"]).style(
                                 f"font-family:monospace; font-size:.75rem;"
                                 f" color:{_MUTED if vdl else _TEXT}; flex:1;"

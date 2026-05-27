@@ -169,12 +169,16 @@ def scan_downloaded_files(out_dir: str) -> set:
         abs_dir = safe_abs_path(out_dir)
         if not os.path.isdir(abs_dir):
             return downloaded
-        for root, _, files in os.walk(abs_dir):
+        for root, dirs, files in os.walk(abs_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
             for fname in files:
                 full_path = os.path.join(root, fname)
                 if not os.path.isfile(full_path):
                     continue
-                if fname.endswith(".meta.json") or fname.endswith(".part") or is_system_file(fname):
+                if (
+                    fname.endswith(".meta.json") or fname.endswith(".part")
+                    or fname.endswith(".thumb") or is_system_file(fname)
+                ):
                     continue
                 downloaded.add(os.path.relpath(full_path, abs_dir))
     except Exception:
@@ -189,9 +193,13 @@ def list_downloaded_files(out_dir: str) -> list:
         abs_dir = safe_abs_path(out_dir)
         if not os.path.isdir(abs_dir):
             return result
-        for root, _, files in os.walk(abs_dir):
+        for root, dirs, files in os.walk(abs_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
             for fname in sorted(files):
-                if fname.endswith(".meta.json") or fname.endswith(".part") or is_system_file(fname):
+                if (
+                    fname.endswith(".meta.json") or fname.endswith(".part")
+                    or fname.endswith(".thumb") or is_system_file(fname)
+                ):
                     continue
                 full_path = os.path.join(root, fname)
                 if not os.path.isfile(full_path):
@@ -199,12 +207,25 @@ def list_downloaded_files(out_dir: str) -> list:
                 rel_path = os.path.relpath(full_path, abs_dir)
                 folder = os.path.dirname(rel_path) or ""
                 size_bytes = os.path.getsize(full_path)
+                # Read thumbnail sidecar written by the downloader on completion
+                msg_id, chat = 0, ""
+                thumb_sidecar = full_path + ".thumb"
+                if os.path.isfile(thumb_sidecar):
+                    try:
+                        with open(thumb_sidecar) as _sf:
+                            _td = json.load(_sf)
+                            msg_id = _td.get("msg_id", 0)
+                            chat   = _td.get("chat", "")
+                    except Exception:
+                        pass
                 result.append({
                     "rel_path": rel_path,
                     "filename": fname,
                     "folder": folder,
                     "size_mb": round(size_bytes / 1048576, 2),
                     "abs_path": full_path,
+                    "msg_id": msg_id,
+                    "chat": chat,
                 })
     except Exception:
         pass

@@ -88,6 +88,13 @@ html, body, .q-page {{ background:{BG} !important; }}
     transition:background .12s;
 }}
 .video-row:hover {{ background:rgba(255,255,255,.04) !important; }}
+.video-row-thumb {{
+    border-radius:4px;
+    padding:3px 8px;
+    transition:background .12s;
+}}
+.video-row-thumb:hover {{ background:rgba(255,255,255,.04) !important; }}
+.video-row-thumb .q-img {{ border-radius:3px; overflow:hidden; }}
 .chip {{
     display:inline-flex; align-items:center;
     padding:1px 7px; border-radius:12px;

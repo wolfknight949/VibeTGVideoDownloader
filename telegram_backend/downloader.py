@@ -36,46 +36,69 @@ def _write_at_offset(path: str, offset: int, data: bytes) -> None:
 async def download_video_parallel(
     client, media, out_path: str, workers: int = 2,
     stop_event=None, on_progress=None,
+    skip_worker_starts=(),
+    on_worker_complete=None,
+    initial_bytes_done: int = 0,
+    worker_resume_chunks: dict = None,   # {start_chunk: chunks_already_done}
+    on_worker_progress=None,             # (start_chunk, chunks_done, total_bytes_done)
 ) -> None:
     total = media.size
     total_chunks = -(-total // _REQUEST_SIZE)
     chunks_per_worker = -(-total_chunks // workers)
 
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _preallocate_file, out_path, total)
+    # Only preallocate when the .part file isn't already the right size (resume case)
+    if not (os.path.exists(out_path) and os.path.getsize(out_path) >= total):
+        await loop.run_in_executor(None, _preallocate_file, out_path, total)
 
-    chunks_done = [0]
-    bytes_done = [0]
+    chunks_done = [initial_bytes_done // _REQUEST_SIZE]
+    bytes_done = [initial_bytes_done]
     speed_samples: deque = deque(maxlen=30)
 
     async def fetch_segment(start_chunk: int):
-        offset = start_chunk * _REQUEST_SIZE
-        limit = min(chunks_per_worker, total_chunks - start_chunk)
+        if start_chunk in skip_worker_starts:
+            return  # already completed in a previous run
+        resume_count = (worker_resume_chunks or {}).get(start_chunk, 0)
+        offset = (start_chunk + resume_count) * _REQUEST_SIZE
+        limit = min(chunks_per_worker, total_chunks - start_chunk) - resume_count
         if limit <= 0:
+            # Segment fully downloaded in a prior run but not marked complete
+            if on_worker_complete:
+                on_worker_complete(start_chunk)
             return
-        async for data in client.iter_download(
-            media,
-            offset=offset,
-            request_size=_REQUEST_SIZE,
-            limit=limit,
-        ):
-            if stop_event and stop_event.is_set():
-                raise asyncio.CancelledError("Stopped by user")
-            write_offset = offset
-            offset += len(data)
-            await loop.run_in_executor(None, _write_at_offset, out_path, write_offset, data)
-            chunks_done[0] += 1
-            bytes_done[0] += len(data)
-            now = time.monotonic()
-            speed_samples.append((now, bytes_done[0]))
-            if len(speed_samples) >= 2:
-                dt = speed_samples[-1][0] - speed_samples[0][0]
-                db = speed_samples[-1][1] - speed_samples[0][1]
-                speed = db / max(dt, 0.1)
-            else:
-                speed = 0.0
-            if on_progress:
-                on_progress(chunks_done[0], total_chunks, bytes_done[0], total, speed)
+        local_chunks = resume_count
+        try:
+            async for data in client.iter_download(
+                media,
+                offset=offset,
+                request_size=_REQUEST_SIZE,
+                limit=limit,
+            ):
+                if stop_event and stop_event.is_set():
+                    raise asyncio.CancelledError("Stopped by user")
+                write_offset = offset
+                offset += len(data)
+                await loop.run_in_executor(None, _write_at_offset, out_path, write_offset, data)
+                chunks_done[0] += 1
+                bytes_done[0] += len(data)
+                local_chunks += 1
+                now = time.monotonic()
+                speed_samples.append((now, bytes_done[0]))
+                if len(speed_samples) >= 2:
+                    dt = speed_samples[-1][0] - speed_samples[0][0]
+                    db = speed_samples[-1][1] - speed_samples[0][1]
+                    speed = db / max(dt, 0.1)
+                else:
+                    speed = 0.0
+                if on_progress:
+                    on_progress(chunks_done[0], total_chunks, bytes_done[0], total, speed)
+        except asyncio.CancelledError:
+            # Save per-worker progress so resume can continue from here
+            if on_worker_progress:
+                on_worker_progress(start_chunk, local_chunks, bytes_done[0])
+            raise
+        if on_worker_complete:
+            on_worker_complete(start_chunk)
 
     await asyncio.gather(*[
         fetch_segment(index * chunks_per_worker)
@@ -142,11 +165,36 @@ async def download_selected_chunks(
                 except OSError:
                     pass
 
-            if os.path.exists(part_path):
+            # Resume support: if a .part file + meta.json exist, read completed workers
+            completed_worker_starts: list = []
+            initial_bytes_done: int = 0
+            worker_chunk_progress: dict = {}   # {start_chunk: chunks_done_so_far}
+            if os.path.exists(part_path) and os.path.exists(meta_json_path):
                 try:
-                    os.remove(part_path)
-                except OSError:
-                    pass
+                    with open(meta_json_path) as _rmf:
+                        _rmeta = json.load(_rmf)
+                    completed_worker_starts = list(_rmeta.get("completed_worker_starts", []))
+                    initial_bytes_done = int(_rmeta.get("bytes_downloaded", 0))
+                    worker_chunk_progress = {
+                        int(k): int(v)
+                        for k, v in _rmeta.get("worker_chunk_progress", {}).items()
+                    }
+                except (json.JSONDecodeError, OSError, ValueError):
+                    # Corrupt meta — start fresh
+                    completed_worker_starts = []
+                    initial_bytes_done = 0
+                    worker_chunk_progress = {}
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+            else:
+                # No valid resume state — delete any stale partial file
+                if os.path.exists(part_path):
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
 
             os.makedirs(target_dir, exist_ok=True)
 
@@ -159,9 +207,9 @@ async def download_selected_chunks(
                 progress_state.update({
                     "file_idx": queue_pos,
                     "filename": filename,
-                    "bytes_done": 0,
+                    "bytes_done": initial_bytes_done,
                     "bytes_total": max(size_bytes, 1),
-                    "chunks_done": 0,
+                    "chunks_done": initial_bytes_done // _REQUEST_SIZE,
                     "chunks_total": max(1, -(-size_bytes // _REQUEST_SIZE)),
                     "speed_mbps": 0.0,
                 })
@@ -186,6 +234,9 @@ async def download_selected_chunks(
                         "topic_id": meta.get("topic_id", 0),
                         "topic_name": meta.get("topic_name", ""),
                         "download_rel_path": download_rel_path,
+                        "completed_worker_starts": [],
+                        "bytes_downloaded": 0,
+                        "worker_chunk_progress": {},
                     }, meta_file)
 
             def on_progress(chunks_done, chunks_total, bytes_done, bytes_total, speed):
@@ -204,6 +255,40 @@ async def download_selected_chunks(
                     progress_state["chunks_total"] = chunks_total
                     progress_state["filename"] = filename
 
+            _total_chunks_n = -(-size_bytes // _REQUEST_SIZE)
+            _cpw_n = -(-_total_chunks_n // file_workers)
+
+            def on_worker_complete(start_chunk: int) -> None:
+                limit = min(_cpw_n, _total_chunks_n - start_chunk)
+                worker_bytes = min(limit * _REQUEST_SIZE,
+                                   max(0, size_bytes - start_chunk * _REQUEST_SIZE))
+                completed_worker_starts.append(start_chunk)
+                # Remove from in-progress tracking now that it's fully done
+                worker_chunk_progress.pop(start_chunk, None)
+                try:
+                    with open(meta_json_path) as _wf:
+                        _wmd = json.load(_wf)
+                    _wmd["completed_worker_starts"] = completed_worker_starts[:]
+                    _wmd["bytes_downloaded"] = _wmd.get("bytes_downloaded", 0) + worker_bytes
+                    _wmd["worker_chunk_progress"] = {str(k): v for k, v in worker_chunk_progress.items()}
+                    with open(meta_json_path, "w") as _wf:
+                        json.dump(_wmd, _wf)
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            def on_worker_progress(start_chunk: int, chunks_done: int, total_bytes: int) -> None:
+                """Called on stop for each in-progress segment — saves resume state."""
+                worker_chunk_progress[start_chunk] = chunks_done
+                try:
+                    with open(meta_json_path) as _wpf:
+                        _wpmd = json.load(_wpf)
+                    _wpmd["worker_chunk_progress"] = {str(k): v for k, v in worker_chunk_progress.items()}
+                    _wpmd["bytes_downloaded"] = total_bytes
+                    with open(meta_json_path, "w") as _wpf:
+                        json.dump(_wpmd, _wpf)
+                except (json.JSONDecodeError, OSError):
+                    pass
+
             await download_video_parallel(
                 client,
                 msg.video,
@@ -211,6 +296,11 @@ async def download_selected_chunks(
                 workers=file_workers,
                 stop_event=stop_event,
                 on_progress=on_progress,
+                skip_worker_starts=set(completed_worker_starts),
+                on_worker_complete=on_worker_complete,
+                initial_bytes_done=initial_bytes_done,
+                worker_resume_chunks=worker_chunk_progress or None,
+                on_worker_progress=on_worker_progress,
             )
 
             part_is_complete = (
@@ -224,6 +314,13 @@ async def download_selected_chunks(
             if os.path.exists(target_file_path) and os.path.getsize(target_file_path) >= size_bytes:
                 try:
                     os.remove(meta_json_path)
+                except OSError:
+                    pass
+                # Write a tiny sidecar so the UI can show thumbnails for completed files
+                thumb_sidecar = target_file_path + ".thumb"
+                try:
+                    with open(thumb_sidecar, "w") as _sf:
+                        json.dump({"msg_id": meta["id"], "chat": target_chat}, _sf)
                 except OSError:
                     pass
                 append_download_log(
