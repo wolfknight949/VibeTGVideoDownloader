@@ -2,6 +2,7 @@ import os
 import shutil
 
 from telethon import TelegramClient
+from telethon.network import ConnectionTcpAbridged
 
 
 def _ensure_session_dir(session_name: str) -> None:
@@ -40,6 +41,7 @@ def create_telegram_client(session_name: str, api_id: int, api_hash: str, purpos
         client_session,
         api_id,
         api_hash,
+        connection=ConnectionTcpAbridged,
         flood_sleep_threshold=60,
         request_retries=5,
     )

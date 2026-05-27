@@ -27,10 +27,9 @@ def _preallocate_file(path: str, size: int) -> None:
         file_handle.write(b"\x00")
 
 
-def _write_at_offset(path: str, offset: int, data: bytes) -> None:
-    with open(path, "r+b") as file_handle:
-        file_handle.seek(offset)
-        file_handle.write(data)
+def _write_with_handle(fh, offset: int, data: bytes) -> None:
+    fh.seek(offset)
+    fh.write(data)
 
 
 async def download_video_parallel(
@@ -67,6 +66,7 @@ async def download_video_parallel(
                 on_worker_complete(start_chunk)
             return
         local_chunks = resume_count
+        fh = open(out_path, "r+b")  # one handle per segment; closed in finally
         try:
             async for data in client.iter_download(
                 media,
@@ -78,7 +78,7 @@ async def download_video_parallel(
                     raise asyncio.CancelledError("Stopped by user")
                 write_offset = offset
                 offset += len(data)
-                await loop.run_in_executor(None, _write_at_offset, out_path, write_offset, data)
+                await loop.run_in_executor(None, _write_with_handle, fh, write_offset, data)
                 chunks_done[0] += 1
                 bytes_done[0] += len(data)
                 local_chunks += 1
@@ -97,6 +97,11 @@ async def download_video_parallel(
             if on_worker_progress:
                 on_worker_progress(start_chunk, local_chunks, bytes_done[0])
             raise
+        finally:
+            try:
+                fh.close()
+            except OSError:
+                pass
         if on_worker_complete:
             on_worker_complete(start_chunk)
 
